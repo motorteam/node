@@ -642,8 +642,12 @@ void uv_tape_go_live(void) {
   }
 }
 
+// Both clocks gate replay on uv_tape_replaying() (live), symmetric with the
+// live-gated record. A pre-live read -- Node times bootstrap milestones with the
+// monotonic clock -- returns the real clock on both record and replay and is
+// never on the tape, so the in-loop reads that the program observes stay aligned.
 uint64_t uv_tape_hrtime(uint64_t real) {
-  if (g_tape.replaying) {
+  if (uv_tape_replaying()) {
     const Entry* e = tape_next(UV_TAPE_CLOCK_MONOTONIC);
     return static_cast<uint64_t>(get_i64(e->ret.ptr));
   }
@@ -655,7 +659,7 @@ uint64_t uv_tape_hrtime(uint64_t real) {
 }
 
 double uv_tape_clock_millis(double real) {
-  if (g_tape.replaying) {
+  if (uv_tape_replaying()) {
     const Entry* e = tape_next(UV_TAPE_CLOCK_REALTIME);
     return static_cast<double>(get_i64(e->ret.ptr));
   }

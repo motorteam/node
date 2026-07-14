@@ -1,3 +1,4 @@
+#include "../deps/uv/src/uv-tape.h"
 #include "async_wrap-inl.h"
 #include "base_object-inl.h"
 #include "debug_utils-inl.h"
@@ -715,14 +716,14 @@ void BindingData::MemoryInfo(MemoryTracker* tracker) const {
 // because there is no Uint64Array in JS.
 // The third entry contains the remaining nanosecond part of the value.
 void BindingData::HrtimeImpl(BindingData* receiver) {
-  uint64_t t = uv_hrtime();
+  uint64_t t = uv_tape_hrtime(uv_hrtime());
   receiver->hrtime_buffer_[0] = (t / NANOS_PER_SEC) >> 32;
   receiver->hrtime_buffer_[1] = (t / NANOS_PER_SEC) & 0xffffffff;
   receiver->hrtime_buffer_[2] = t % NANOS_PER_SEC;
 }
 
 void BindingData::HrtimeBigIntImpl(BindingData* receiver) {
-  uint64_t t = uv_hrtime();
+  uint64_t t = uv_tape_hrtime(uv_hrtime());
   // The buffer is a Uint32Array, so we need to reinterpret it as a
   // Uint64Array to write the value. The buffer is valid at this scope so we
   // can safely cast away the constness.
