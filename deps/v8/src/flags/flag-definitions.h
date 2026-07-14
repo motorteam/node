@@ -1188,6 +1188,8 @@ DEFINE_BOOL(stress_lazy, false, "stress lazy compilation")
 DEFINE_STRING(print_bytecode_filter, "*",
               "filter for selecting which functions to print bytecode")
 DEFINE_BOOL(omit_default_ctors, true, "omit calling default ctors in bytecode")
+DEFINE_BOOL(tape_view, false,
+            "record a call tree of the run for Node's --tape-view")
 #ifdef V8_TRACE_UNOPTIMIZED
 DEFINE_BOOL(trace_unoptimized, false,
             "trace the bytecodes executed by all unoptimized execution")

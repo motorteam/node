@@ -55,6 +55,21 @@ InterpreterAssembler::InterpreterAssembler(CodeAssemblerState* state,
   TraceBytecode(Runtime::kDumpExecutionFrame);
 #endif
 
+  // Node tape view: a runtime-gated per-bytecode hook. When v8_flags.tape_view
+  // is off -- every normal, record and replay run -- this is a single
+  // predictable branch and nothing more. Only under --tape-view does it call
+  // out to record the call tree. See runtime-trace.cc.
+  {
+    Label tape_view_done(this);
+    GotoIfNot(LoadRuntimeFlag(ExternalReference::address_of_tape_view_flag()),
+              &tape_view_done);
+    CallRuntime(Runtime::kTapeViewRecordBytecode, GetContext(),
+                BytecodeArrayTaggedPointer(), SmiTag(BytecodeOffset()),
+                GetAccumulatorUnchecked());
+    Goto(&tape_view_done);
+    BIND(&tape_view_done);
+  }
+
   RegisterCallGenerationCallbacks([this] { CallPrologue(); },
                                   [this] { CallEpilogue(); });
 

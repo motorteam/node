@@ -96,6 +96,7 @@ enum class IsolateFieldId : uint8_t;
   V(abort_with_reason, "abort_with_reason")                                    \
   V(abort_with_sandbox_violation, "abort_with_sandbox_violation")              \
   V(address_of_log_or_trace_osr, "v8_flags.log_or_trace_osr")                  \
+  V(address_of_tape_view_flag, "v8_flags.tape_view")                           \
   V(address_of_builtin_subclassing_flag, "v8_flags.builtin_subclassing")       \
   V(address_of_double_abs_constant, "double_absolute_constant")                \
   V(address_of_double_neg_constant, "double_negate_constant")                  \

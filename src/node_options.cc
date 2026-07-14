@@ -1362,6 +1362,10 @@ PerProcessOptionsParser::PerProcessOptionsParser(
             "decode and print the tape at PATH, then exit",
             &PerProcessOptions::tape_inspect,
             kDisallowedInEnvvar);
+  AddOption("--tape-view",
+            "replay the tape at PATH and print the program's call tree",
+            &PerProcessOptions::tape_view,
+            kDisallowedInEnvvar);
   AddOption("--title",
             "the process title to use on startup",
             &PerProcessOptions::title,

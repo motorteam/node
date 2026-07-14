@@ -33,6 +33,10 @@
 
 #include <zstd.h>
 
+// Defined in deps/v8/src/runtime/runtime-trace.cc. A no-op unless --tape-view
+// turned on v8_flags.tape_view; lets go-live gate the recorded call tree.
+extern "C" void v8_tape_view_set_live(int live);
+
 namespace {
 
 constexpr uint8_t kFormatVersion = 2;    // matches Watt's CURRENT_SPOOL_FORMAT
@@ -627,8 +631,13 @@ int uv_tape_replaying(void) { return g_tape.replaying && g_tape.live; }
  * which is where Node I/O naturally lives anyway.
  */
 void uv_tape_go_live(void) {
-  if (g_tape.recording || g_tape.replaying)
+  if (g_tape.recording || g_tape.replaying) {
     g_tape.live = 1;
+    // Tell the tape-view call-tree recorder the program is now running, so the
+    // module-loading calls before the loop stay off the tree. A no-op unless
+    // --tape-view turned on v8_flags.tape_view. Defined in deps/v8.
+    v8_tape_view_set_live(1);
+  }
 }
 
 uint64_t uv_tape_hrtime(uint64_t real) {

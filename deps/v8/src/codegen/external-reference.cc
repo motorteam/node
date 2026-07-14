@@ -877,6 +877,10 @@ ExternalReference ExternalReference::address_of_log_or_trace_osr() {
   return ExternalReference(&v8_flags.log_or_trace_osr);
 }
 
+ExternalReference ExternalReference::address_of_tape_view_flag() {
+  return ExternalReference(&v8_flags.tape_view);
+}
+
 ExternalReference ExternalReference::address_of_builtin_subclassing_flag() {
   return ExternalReference(&v8_flags.builtin_subclassing);
 }

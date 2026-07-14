@@ -209,10 +209,16 @@ constexpr bool CanTriggerGC(T... properties) {
 #define FOR_EACH_INTRINSIC_TRACE_FEEDBACK(F, I)
 #endif
 
+// Node tape view: always available (gated at runtime on v8_flags.tape_view),
+// so a single binary can view without a special build.
+#define FOR_EACH_INTRINSIC_TAPE_VIEW(F, I) \
+  F(TapeViewRecordBytecode, 3, 1)
+
 #define FOR_EACH_INTRINSIC_TRACE(F, I)       \
   FOR_EACH_INTRINSIC_TRACE_UNOPTIMIZED(F, I) \
   FOR_EACH_INTRINSIC_TRACE_FEEDBACK(F, I)    \
-  FOR_EACH_INTRINSIC_TRACE_DUMPLING(F, I)
+  FOR_EACH_INTRINSIC_TRACE_DUMPLING(F, I)    \
+  FOR_EACH_INTRINSIC_TAPE_VIEW(F, I)
 
 #define FOR_EACH_INTRINSIC_FUNCTION(F, I)  \
   F(Call, -1 /* >= 2 */, 1)                \

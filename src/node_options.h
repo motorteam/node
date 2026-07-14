@@ -337,6 +337,7 @@ class PerProcessOptions : public Options {
   std::string tape_record;
   std::string tape_replay;
   std::string tape_inspect;
+  std::string tape_view;
   std::string trace_event_categories;
   std::string trace_event_file_pattern = "node_trace.${rotation}.log";
   int64_t v8_thread_pool_size = 4;

@@ -1,6 +1,10 @@
 #include "../deps/uv/src/uv-tape.h"
 #include "node_main_instance.h"
 #include <memory>
+
+// Defined in deps/v8/src/runtime/runtime-trace.cc: render the call tree that
+// the interpreter recorded during a --tape-view replay.
+extern "C" void v8_tape_view_render_plain(void);
 #if HAVE_OPENSSL
 #include "crypto/crypto_util.h"
 #endif  // HAVE_OPENSSL
@@ -110,11 +114,15 @@ void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
       return;
     }
     // Arm the tape before the program runs. Startup IO (the module loader, the
-    // compile cache) is paused separately; see NODEJS.md.
+    // compile cache) is paused separately; see NODEJS.md. --tape-view replays a
+    // tape while V8 records the program's call tree (see runtime-trace.cc), so
+    // it arms replay too and renders the tree once the run is done.
     if (!per_process::cli_options->tape_record.empty())
       uv_tape_record_to(per_process::cli_options->tape_record.c_str());
     else if (!per_process::cli_options->tape_replay.empty())
       uv_tape_replay_from(per_process::cli_options->tape_replay.c_str());
+    else if (!per_process::cli_options->tape_view.empty())
+      uv_tape_replay_from(per_process::cli_options->tape_view.c_str());
 
     if (!sea::MaybeLoadSingleExecutableApplication(env)) {
       LoadEnvironment(env, StartExecutionCallbackWithModule{});
@@ -126,6 +134,10 @@ void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
     // Seal the tape once the loop has drained and the program is done.
     if (UV_TAPE_ACTIVE())
       uv_tape_finish(static_cast<int>(*exit_code));
+
+    // Render the recorded call tree.
+    if (!per_process::cli_options->tape_view.empty())
+      v8_tape_view_render_plain();
   }
 
 #if defined(LEAK_SANITIZER)

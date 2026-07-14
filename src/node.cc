@@ -801,11 +801,19 @@ static ExitCode ProcessGlobalArgsInternal(std::vector<std::string>* args,
   // ships exactly this block for snapshots; a tape reuses it. Applied here,
   // before SetFlagsFromCommandLine locks the flags, and after the parse above
   // has populated tape_record/tape_replay.
+  // --tape-view replays a tape, so it needs the same pinning.
   if (!per_process::cli_options->tape_record.empty() ||
-      !per_process::cli_options->tape_replay.empty()) {
+      !per_process::cli_options->tape_replay.empty() ||
+      !per_process::cli_options->tape_view.empty()) {
     V8::SetFlagsFromString("--predictable");
     V8::SetFlagsFromString("--random_seed=42");
     V8::SetFlagsFromString("--hash_seed=1");
+  }
+
+  // Turn on the interpreter's call-tree hook only for --tape-view, so every
+  // other run pays nothing for it. See deps/v8 runtime-trace.cc.
+  if (!per_process::cli_options->tape_view.empty()) {
+    V8::SetFlagsFromString("--tape_view");
   }
 
   std::vector<char*> v8_args_as_char_ptr(v8_args.size());
