@@ -60,6 +60,15 @@ enum uv_tape_effect {
   /* A synchronous fs op (cb == NULL) -- served inline at the call site, like a
    * clock, with no schedule. Carries fs_type, result, and payload. */
   UV_TAPE_FS_SYNC         = 8,
+  /* Stream completions, delivered by the loop like fs.done. A connect finishing,
+   * a write flushing (with the bytes, for the divergence check), and a chunk of
+   * data (or EOF/error) arriving on a reading stream. See the schedule below. */
+  UV_TAPE_STREAM_CONNECT  = 9,
+  UV_TAPE_STREAM_WRITE    = 10,
+  UV_TAPE_STREAM_READ     = 11,
+  /* A synchronous stream write -- uv_try_write, which Node uses for small socket
+   * writes before falling back to the async path. Served inline like fs.sync. */
+  UV_TAPE_STREAM_WRITE_SYNC = 12,
   UV_TAPE_EFFECT_MAX
 };
 
@@ -117,9 +126,12 @@ void uv_tape_random(void* buf, size_t len, int ret);
  */
 struct uv__work;
 
-/* Effect kinds for the thread-pool schedule. Append only. */
+/* Effect kinds for the schedule -- what the pending request is, so the pump can
+ * dispatch a completion to the right delivery path. Append only. */
 enum uv_tape_pool_kind {
-  UV_TAPE_POOL_FS = 1,
+  UV_TAPE_POOL_FS             = 1,   /* thread-pool fs, keyed by uv__work */
+  UV_TAPE_STREAM_KIND_CONNECT = 2,   /* uv_connect_t */
+  UV_TAPE_STREAM_KIND_WRITE   = 3,   /* uv_write_t */
 };
 
 /*
@@ -165,6 +177,52 @@ void uv_tape_fs_sync_next(int expected_fs_type, long long* result,
  * recorded -- so a program that computes different output is caught. */
 void uv_tape_check_write(const void* recorded, size_t rlen,
                          const void* presented, size_t plen);
+
+/* ---- Streams: connect, write, read ---------------------------------------
+ *
+ * A socket's whole life is on the schedule. Its connect and each write are
+ * requests (uv_connect_t, uv_write_t), so they get a seq at submit and their
+ * completions are matched by seq -- exactly like fs. Reads are different: they
+ * are not requests but a series of deliveries on a *reading stream*, so the
+ * stream gets a deterministic id at read_start and each recorded chunk carries
+ * it. On replay none of the real socket calls happen: submit registers the
+ * request pending, read_start registers the stream, and the pump delivers the
+ * recorded completions in order via the uv__stream_tape_deliver_* functions.
+ */
+
+/* At uv__tcp_connect / uv_write2. Stamps *seq. Returns 1 if replaying (caller
+ * must NOT perform real I/O), else 0. `kind` is UV_TAPE_STREAM_KIND_*. */
+int uv_tape_stream_submit(unsigned long long* seq, int kind, void* req);
+
+/* Recorded on the loop thread when a completion fires (record only). */
+void uv_tape_stream_connect_record(unsigned long long seq, int status);
+void uv_tape_stream_write_record(unsigned long long seq, int status,
+                                 const void* bytes, size_t len);
+
+/* At uv__read_start / uv_read_stop. read_start returns the stream's id and, on
+ * replay, registers the handle and sets *replay=1 (caller must not start a real
+ * fd watcher). `nread` in _read_record is what read_cb receives: >0 bytes, or a
+ * negative libuv error (UV_EOF at clean end of stream). */
+unsigned long long uv_tape_stream_read_start(void* stream, int* replay);
+void uv_tape_stream_read_stop(void* stream);
+void uv_tape_stream_read_record(unsigned long long stream_id, long long nread,
+                                const void* bytes, size_t len);
+
+/* Synchronous stream write (uv_try_write), served inline. Record captures the
+ * bytes and the count actually written; replay checks the bytes the program
+ * presents and returns the recorded count without touching the socket. */
+void uv_tape_stream_write_sync_record(long long result,
+                                      const void* bytes, size_t len);
+long long uv_tape_stream_write_sync_check(const void* presented, size_t plen);
+
+/* Delivery paths, defined in stream.c, called by the pump under replay. Each
+ * runs the normal completion bookkeeping minus the real syscall, then re-enters
+ * JS through the user callback. */
+void uv__stream_tape_deliver_connect(void* connect_req, int status);
+void uv__stream_tape_deliver_write(void* write_req, int status,
+                                   const void* recorded, size_t rlen);
+void uv__stream_tape_deliver_read(void* stream, long long nread,
+                                  const void* bytes, size_t len);
 
 /* Seal the tape. Called from Node once the program has finished. */
 void uv_tape_finish(int exit_status);

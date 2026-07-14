@@ -46,6 +46,7 @@ const char* const kEffectFqn[] = {
     "clock.realtime", "clock.monotonic", "random.bytes",
     "io.read", "io.write", "kernel.halt", "kernel.abort",
     "fs.done", "fs.sync",
+    "stream.connect", "stream.write", "stream.read", "stream.write.sync",
 };
 
 const char* const kEffectSig[] = {
@@ -58,6 +59,10 @@ const char* const kEffectSig[] = {
     "() -> never",               // kernel.abort
     "(seq, fs) -> int",          // fs.done -- an async completion
     "(fs) -> int",               // fs.sync -- a synchronous fs op
+    "(seq) -> int",              // stream.connect -- a connect completing
+    "(seq, [[byte]]) -> int",    // stream.write   -- a write, with its bytes
+    "(id, [[byte]]) -> int",     // stream.read    -- a chunk (or EOF) delivered
+    "([[byte]]) -> int",         // stream.write.sync -- a synchronous try_write
 };
 
 // ---- Growable byte buffer -------------------------------------------------
@@ -560,6 +565,49 @@ bool pending_take(uint64_t seq, Pending* out) {
   return false;
 }
 
+// ---- Reading-stream registry ----------------------------------------------
+//
+// Reads are not requests, so they cannot ride the pending-by-seq registry.
+// Instead every reading stream gets a deterministic id at read_start (a counter
+// bumped in program order, so record and replay agree), and each recorded chunk
+// carries it. On replay this maps the id back to the live handle so the pump can
+// hand the bytes to its read_cb.
+struct StreamReg { uint64_t id; void* handle; };
+struct {
+  StreamReg* items = nullptr;
+  size_t n = 0;
+  size_t cap = 0;
+  uint64_t next_id = 1;   // 0 means "not a taped stream"
+} g_streams;
+
+void stream_reg_add(uint64_t id, void* handle) {
+  for (size_t i = 0; i < g_streams.n; i++) {
+    if (g_streams.items[i].id == id) { g_streams.items[i].handle = handle; return; }
+  }
+  if (g_streams.n == g_streams.cap) {
+    size_t cap = g_streams.cap ? g_streams.cap * 2 : 16;
+    g_streams.items = static_cast<StreamReg*>(realloc(g_streams.items, cap * sizeof(StreamReg)));
+    if (g_streams.items == nullptr) abort();
+    g_streams.cap = cap;
+  }
+  g_streams.items[g_streams.n].id = id;
+  g_streams.items[g_streams.n].handle = handle;
+  g_streams.n++;
+}
+
+void* stream_reg_find(uint64_t id) {
+  for (size_t i = 0; i < g_streams.n; i++)
+    if (g_streams.items[i].id == id) return g_streams.items[i].handle;
+  return nullptr;
+}
+
+void stream_reg_remove_handle(void* handle) {
+  for (size_t i = 0; i < g_streams.n; i++) {
+    if (g_streams.items[i].handle == handle)
+      g_streams.items[i] = g_streams.items[--g_streams.n];
+  }
+}
+
 // ---- The C ABI declared in uv-tape.h --------------------------------------
 
 extern "C" {
@@ -660,18 +708,36 @@ int uv_tape_pump(void) {
   if (g_tape.cursor >= g_tape.n_entries) return 0;
 
   const Entry* e = &g_tape.entries[g_tape.cursor];
-  if (e->func_index != UV_TAPE_FS_DONE) {
-    // The next recorded effect is not a completion -- so it is a clock/random
-    // read that the program's synchronous code should have consumed already, or
-    // the terminal halt. Either way there is nothing for the loop to deliver.
+  const int fx = e->func_index;
+  if (fx != UV_TAPE_FS_DONE && fx != UV_TAPE_STREAM_CONNECT &&
+      fx != UV_TAPE_STREAM_WRITE && fx != UV_TAPE_STREAM_READ) {
+    // The next recorded effect is not a loop completion -- so it is a
+    // clock/random/sync read the program's synchronous code should already have
+    // consumed, or the terminal halt. Nothing for the loop to deliver.
     return 0;
   }
 
-  uint64_t seq = e->args.len >= 4 ? get_u32(e->args.ptr) : 0;
-  int fs_type  = e->args.len >= 8 ? static_cast<int>(get_u32(e->args.ptr + 4)) : 0;
-  int64_t result = e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
   const Iov* iov = entry_find_iov(e, 0);
+  int64_t result = e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
 
+  // A stream read is keyed by stream id, not a pending request -- deliver it to
+  // the registered handle. The others (fs, connect, write) are keyed by seq.
+  if (fx == UV_TAPE_STREAM_READ) {
+    uint64_t id = e->args.len >= 4 ? get_u32(e->args.ptr) : 0;
+    void* stream = stream_reg_find(id);
+    if (stream == nullptr) {
+      tape_diverged("recorded read for stream %llu, but no such stream is reading; "
+                    "the program diverged",
+                    static_cast<unsigned long long>(id));
+    }
+    g_tape.cursor++;
+    uv__stream_tape_deliver_read(stream, result,
+                                 iov ? iov->bytes.ptr : nullptr,
+                                 iov ? iov->bytes.len : 0);
+    return 1;
+  }
+
+  uint64_t seq = e->args.len >= 4 ? get_u32(e->args.ptr) : 0;
   Pending p;
   if (!pending_take(seq, &p)) {
     tape_diverged("completion for seq %llu has no matching pending request; "
@@ -679,27 +745,42 @@ int uv_tape_pump(void) {
                   static_cast<unsigned long long>(seq));
   }
 
-  // The seq matched, but a different program can reuse the same seq for a
-  // different operation. Check the request's actual type against what was
-  // recorded, so a divergent program stops here rather than getting one
-  // operation's result served into another.
-  if (p.kind == UV_TAPE_POOL_FS) {
+  // The seq matched, but a divergent program can reuse a seq for a different
+  // operation. Check the pending request's kind against the recorded effect so
+  // one operation's result is never served into another.
+  int want_kind = fx == UV_TAPE_FS_DONE        ? UV_TAPE_POOL_FS
+                : fx == UV_TAPE_STREAM_CONNECT  ? UV_TAPE_STREAM_KIND_CONNECT
+                                                : UV_TAPE_STREAM_KIND_WRITE;
+  if (p.kind != want_kind) {
+    tape_diverged("request %llu is a different kind of operation than the tape "
+                  "recorded here; the program diverged",
+                  static_cast<unsigned long long>(seq));
+  }
+
+  if (fx == UV_TAPE_FS_DONE) {
+    int fs_type = e->args.len >= 8 ? static_cast<int>(get_u32(e->args.ptr + 4)) : 0;
     int actual = static_cast<int>(reinterpret_cast<uv_fs_t*>(p.req)->fs_type);
     if (actual != fs_type) {
       tape_diverged("request %llu is fs_type %d, but the tape recorded fs_type %d "
                     "at this point; the program diverged",
                     static_cast<unsigned long long>(seq), actual, fs_type);
     }
-  }
-  g_tape.cursor++;
-
-  if (p.kind == UV_TAPE_POOL_FS) {
+    g_tape.cursor++;
     uv__fs_tape_fill(p.req, fs_type, result,
                      iov ? iov->bytes.ptr : nullptr, iov ? iov->bytes.len : 0);
+    // Runs the fs done wrapper (uv__fs_done): calls the cb, re-enters JS.
+    p.w->done(p.w, 0);
+    return 1;
   }
-  // Deliver: this runs the effect's done wrapper (uv__fs_done), which calls the
-  // request's cb and re-enters JS -- exactly the normal completion path.
-  p.w->done(p.w, 0);
+
+  g_tape.cursor++;
+  if (fx == UV_TAPE_STREAM_CONNECT) {
+    uv__stream_tape_deliver_connect(p.req, static_cast<int>(result));
+  } else {  // UV_TAPE_STREAM_WRITE
+    uv__stream_tape_deliver_write(p.req, static_cast<int>(result),
+                                  iov ? iov->bytes.ptr : nullptr,
+                                  iov ? iov->bytes.len : 0);
+  }
   return 1;
 }
 
@@ -745,6 +826,82 @@ void uv_tape_check_write(const void* recorded, size_t rlen,
     got[o++] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : (p[i] == '\n' ? '.' : '?');
   tape_diverged("output diverged at byte %zu\n  recorded: %s\n  replayed: %s",
                 at, rec, got);
+}
+
+// ---- Streams --------------------------------------------------------------
+
+int uv_tape_stream_submit(unsigned long long* seq, int kind, void* req) {
+  // Like uv_tape_submit: armed (not necessarily live) is enough to stamp a seq,
+  // because a socket opened at top-level still completes inside the live loop.
+  if (!g_tape.recording && !g_tape.replaying) { if (seq) *seq = 0; return 0; }
+  uint64_t s = g_pending.next_seq++;
+  if (seq) *seq = s;
+  if (g_tape.replaying) {
+    pending_add(s, nullptr, kind, req);
+    return 1;   // caller must not perform real I/O
+  }
+  return 0;
+}
+
+void uv_tape_stream_connect_record(unsigned long long seq, int status) {
+  Entry* e = entry_begin(UV_TAPE_STREAM_CONNECT);
+  if (e == nullptr) return;
+  put_u32(&e->args, static_cast<uint32_t>(seq));
+  put_i64(&e->ret, status);
+  entry_commit(e);
+}
+
+void uv_tape_stream_write_record(unsigned long long seq, int status,
+                                 const void* bytes, size_t len) {
+  Entry* e = entry_begin(UV_TAPE_STREAM_WRITE);
+  if (e == nullptr) return;
+  put_u32(&e->args, static_cast<uint32_t>(seq));
+  if (bytes != nullptr && len > 0) entry_iov(e, 0, bytes, len);
+  put_i64(&e->ret, status);
+  entry_commit(e);
+}
+
+unsigned long long uv_tape_stream_read_start(void* stream, int* replay) {
+  if (!g_tape.recording && !g_tape.replaying) { if (replay) *replay = 0; return 0; }
+  uint64_t id = g_streams.next_id++;
+  if (g_tape.replaying) {
+    stream_reg_add(id, stream);
+    if (replay) *replay = 1;
+  } else if (replay) {
+    *replay = 0;
+  }
+  return id;
+}
+
+void uv_tape_stream_read_stop(void* stream) {
+  stream_reg_remove_handle(stream);
+}
+
+void uv_tape_stream_read_record(unsigned long long stream_id, long long nread,
+                                const void* bytes, size_t len) {
+  Entry* e = entry_begin(UV_TAPE_STREAM_READ);
+  if (e == nullptr) return;
+  put_u32(&e->args, static_cast<uint32_t>(stream_id));
+  if (nread > 0 && bytes != nullptr && len > 0) entry_iov(e, 0, bytes, len);
+  put_i64(&e->ret, nread);
+  entry_commit(e);
+}
+
+void uv_tape_stream_write_sync_record(long long result,
+                                      const void* bytes, size_t len) {
+  Entry* e = entry_begin(UV_TAPE_STREAM_WRITE_SYNC);
+  if (e == nullptr) return;
+  if (bytes != nullptr && len > 0) entry_iov(e, 0, bytes, len);
+  put_i64(&e->ret, result);
+  entry_commit(e);
+}
+
+long long uv_tape_stream_write_sync_check(const void* presented, size_t plen) {
+  const Entry* e = tape_next(UV_TAPE_STREAM_WRITE_SYNC);
+  const Iov* iov = entry_find_iov(e, 0);
+  uv_tape_check_write(iov ? iov->bytes.ptr : nullptr, iov ? iov->bytes.len : 0,
+                      presented, plen);
+  return e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
 }
 
 void uv_tape_finish(int exit_status) {

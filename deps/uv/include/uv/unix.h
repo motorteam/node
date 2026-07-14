@@ -260,9 +260,13 @@ typedef struct {
   unsigned int nbufs;                                                         \
   int error;                                                                  \
   uv_buf_t bufsml[4];                                                         \
+  unsigned long long tape_seq;   /* schedule seq, 0 if untaped */             \
+  void* tape_bytes;              /* stashed write payload for the tape */      \
+  size_t tape_len;                                                            \
 
 #define UV_CONNECT_PRIVATE_FIELDS                                             \
   struct uv__queue queue;                                                     \
+  unsigned long long tape_seq;   /* schedule seq, 0 if untaped */             \
 
 #define UV_SHUTDOWN_PRIVATE_FIELDS /* empty */
 
@@ -292,6 +296,7 @@ typedef struct {
   int delayed_error;                                                          \
   int accepted_fd;                                                            \
   void* queued_fds;                                                           \
+  unsigned long long tape_stream_id;  /* id for reads on the tape, 0 if none */ \
   UV_STREAM_PRIVATE_PLATFORM_FIELDS                                           \
 
 #define UV_TCP_PRIVATE_FIELDS /* empty */

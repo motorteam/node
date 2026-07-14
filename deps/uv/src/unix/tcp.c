@@ -21,6 +21,7 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "uv-tape.h"
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -296,6 +297,18 @@ int uv__tcp_connect(uv_connect_t* req,
                          UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
   if (err)
     return err;
+
+  /* Tape: stamp a seq on the request. On replay, do not perform a real connect;
+   * register it pending and let the pump deliver the recorded completion. The
+   * socket fd exists (harmless, never used) so the handle's flags are set. */
+  if (uv_tape_stream_submit(&req->tape_seq, UV_TAPE_STREAM_KIND_CONNECT, req)) {
+    uv__req_init(handle->loop, req, UV_CONNECT);
+    req->cb = cb;
+    req->handle = (uv_stream_t*) handle;
+    uv__queue_init(&req->queue);
+    handle->connect_req = req;
+    return 0;
+  }
 
   if (uv__is_ipv6_link_local(addr)) {
     memcpy(&tmp6, addr, sizeof(tmp6));

@@ -39,6 +39,33 @@ UV_TAPE_WEAK void uv_tape_fs_sync_next(int a, long long* b, const void** c, size
 UV_TAPE_WEAK void uv_tape_check_write(const void* a, size_t b, const void* c, size_t d) {
   (void)a;(void)b;(void)c;(void)d;
 }
+UV_TAPE_WEAK int uv_tape_stream_submit(unsigned long long* seq, int kind, void* req) {
+  (void)kind; (void)req; if (seq) *seq = 0; return 0;
+}
+UV_TAPE_WEAK void uv_tape_stream_connect_record(unsigned long long seq, int status) {
+  (void)seq; (void)status;
+}
+UV_TAPE_WEAK void uv_tape_stream_write_record(unsigned long long seq, int status,
+    const void* bytes, size_t len) {
+  (void)seq; (void)status; (void)bytes; (void)len;
+}
+UV_TAPE_WEAK unsigned long long uv_tape_stream_read_start(void* stream, int* replay) {
+  (void)stream; if (replay) *replay = 0; return 0;
+}
+UV_TAPE_WEAK void uv_tape_stream_read_stop(void* stream) { (void)stream; }
+UV_TAPE_WEAK void uv_tape_stream_read_record(unsigned long long id, long long nread,
+    const void* bytes, size_t len) {
+  (void)id; (void)nread; (void)bytes; (void)len;
+}
+UV_TAPE_WEAK void uv_tape_stream_write_sync_record(long long result,
+    const void* bytes, size_t len) {
+  (void)result; (void)bytes; (void)len;
+}
+UV_TAPE_WEAK long long uv_tape_stream_write_sync_check(const void* presented, size_t plen) {
+  (void)presented; (void)plen; return 0;
+}
+/* uv__stream_tape_deliver_* are defined in stream.c (always part of libuv), so
+ * they never need a weak fallback. */
 UV_TAPE_WEAK void uv_tape_record_to(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_replay_from(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_inspect(const char* path) { (void)path; }

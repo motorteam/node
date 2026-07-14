@@ -21,6 +21,7 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "uv-tape.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -914,6 +915,18 @@ static void uv__write_callbacks(uv_stream_t* stream) {
     uv__queue_remove(q);
     uv__req_unregister(stream->loop);
 
+    /* Tape: record the write's completion and the bytes it flushed (stashed at
+     * uv_write2, since the bufs are consumed by now). The bytes let replay catch
+     * a program that computes different output. */
+    if (uv_tape_recording() && req->tape_seq != 0)
+      uv_tape_stream_write_record(req->tape_seq, req->error,
+                                  req->tape_bytes, req->tape_len);
+    if (req->tape_bytes != NULL) {
+      uv__free(req->tape_bytes);
+      req->tape_bytes = NULL;
+      req->tape_len = 0;
+    }
+
     if (req->bufs != NULL) {
       stream->write_queue_size -= uv__write_req_size(req);
       if (req->bufs != req->bufsml)
@@ -934,6 +947,9 @@ static void uv__stream_eof(uv_stream_t* stream, const uv_buf_t* buf) {
   uv__io_stop(stream->loop, &stream->io_watcher, POLLIN);
   uv__handle_stop(stream);
   uv__stream_osx_interrupt_select(stream);
+  /* Tape: end of stream is a schedule entry too (nread == UV_EOF). */
+  if (uv_tape_recording() && stream->tape_stream_id != 0)
+    uv_tape_stream_read_record(stream->tape_stream_id, UV_EOF, NULL, 0);
   stream->read_cb(stream, UV_EOF, buf);
 }
 
@@ -1095,6 +1111,8 @@ static void uv__read(uv_stream_t* stream) {
       } else {
         /* Error. User should call uv_close(). */
         stream->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
+        if (uv_tape_recording() && stream->tape_stream_id != 0)
+          uv_tape_stream_read_record(stream->tape_stream_id, UV__ERR(errno), NULL, 0);
         stream->read_cb(stream, UV__ERR(errno), &buf);
         if (stream->flags & UV_HANDLE_READING) {
           stream->flags &= ~UV_HANDLE_READING;
@@ -1142,6 +1160,11 @@ static void uv__read(uv_stream_t* stream) {
         msg.msg_iov = old;
       }
 #endif
+      /* Tape: a chunk delivered to a reading stream is a schedule entry. */
+      if (uv_tape_recording() && stream->tape_stream_id != 0)
+        uv_tape_stream_read_record(stream->tape_stream_id, nread,
+                                   buf.base, (size_t) nread);
+
       stream->read_cb(stream, nread, &buf);
 
       /* Save a system call and return if we didn't fill the buffer
@@ -1240,6 +1263,110 @@ void uv__stream_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 }
 
 
+/* ---- Tape replay delivery -------------------------------------------------
+ *
+ * Called by the pump (tape.cc) in place of the kernel. Each runs the normal
+ * completion bookkeeping minus the real syscall, then re-enters JS through the
+ * user callback -- so the program sees exactly what it saw on record.
+ */
+
+void uv__stream_tape_deliver_connect(void* vreq, int status) {
+  uv_connect_t* req = (uv_connect_t*) vreq;
+  uv_stream_t* stream = req->handle;
+
+  stream->connect_req = NULL;
+  uv__req_unregister(stream->loop);
+  /* No POLLOUT watcher was ever started on replay, so nothing to io_stop. */
+  if (req->cb)
+    req->cb(req, status);
+}
+
+void uv__stream_tape_deliver_write(void* vreq, int status,
+                                   const void* recorded, size_t rlen) {
+  uv_write_t* req = (uv_write_t*) vreq;
+  uv_stream_t* stream = req->handle;
+
+  /* Check the bytes the program presents against the tape before freeing them,
+   * so a program that computes different output diverges here. On replay the
+   * bufs are untouched (uv__write never ran), so write_index is still 0. */
+  if (req->bufs != NULL) {
+    size_t total = 0;
+    unsigned int i;
+    char* flat;
+    for (i = req->write_index; i < req->nbufs; i++)
+      total += req->bufs[i].len;
+    flat = uv__malloc(total ? total : 1);
+    if (flat != NULL) {
+      size_t off = 0;
+      for (i = req->write_index; i < req->nbufs; i++) {
+        memcpy(flat + off, req->bufs[i].base, req->bufs[i].len);
+        off += req->bufs[i].len;
+      }
+      uv_tape_check_write(recorded, rlen, flat, total);
+      uv__free(flat);
+    }
+  }
+
+  /* Complete the request the way uv__write_callbacks would, minus io_feed. */
+  uv__queue_remove(&req->queue);
+  uv__req_unregister(stream->loop);
+  if (req->bufs != NULL) {
+    stream->write_queue_size -= uv__write_req_size(req);
+    if (req->bufs != req->bufsml)
+      uv__free(req->bufs);
+    req->bufs = NULL;
+  }
+  if (req->cb)
+    req->cb(req, status);
+}
+
+void uv__stream_tape_deliver_read(void* vstream, long long nread,
+                                  const void* bytes, size_t len) {
+  uv_stream_t* stream = (uv_stream_t*) vstream;
+  uv_buf_t buf;
+
+  if (nread == UV_EOF) {
+    uv_buf_t empty = { NULL, 0 };
+    stream->flags |= UV_HANDLE_READ_EOF;
+    stream->flags &= ~UV_HANDLE_READING;
+    uv__handle_stop(stream);
+    uv_tape_stream_read_stop(stream);
+    if (stream->read_cb)
+      stream->read_cb(stream, UV_EOF, &empty);
+    return;
+  }
+
+  if (nread < 0) {
+    uv_buf_t empty = { NULL, 0 };
+    stream->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
+    if (stream->read_cb)
+      stream->read_cb(stream, (ssize_t) nread, &empty);
+    if (stream->flags & UV_HANDLE_READING) {
+      stream->flags &= ~UV_HANDLE_READING;
+      uv__handle_stop(stream);
+    }
+    uv_tape_stream_read_stop(stream);
+    return;
+  }
+
+  /* Success: ask the program for a buffer, fill it from the tape, deliver. */
+  buf = uv_buf_init(NULL, 0);
+  stream->alloc_cb((uv_handle_t*) stream, 64 * 1024, &buf);
+  if (buf.base == NULL || buf.len == 0) {
+    if (stream->read_cb)
+      stream->read_cb(stream, UV_ENOBUFS, &buf);
+    return;
+  }
+  {
+    size_t n = len < buf.len ? len : buf.len;
+    if (n > 0)
+      memcpy(buf.base, bytes, n);
+    if (stream->read_cb)
+      stream->read_cb(stream, (ssize_t) n, &buf);
+  }
+}
+
+
 /**
  * We get called here from directly following a call to connect(2).
  * In order to determine if we've errored out or succeeded must call
@@ -1280,6 +1407,11 @@ static void uv__stream_connect(uv_stream_t* stream) {
   if (error < 0 || uv__queue_empty(&stream->write_queue)) {
     uv__io_stop(stream->loop, &stream->io_watcher, POLLOUT);
   }
+
+  /* Tape: a connect completing is a schedule entry. (Replay never reaches here;
+   * the pump calls uv__stream_tape_deliver_connect instead.) */
+  if (uv_tape_recording() && req->tape_seq != 0)
+    uv_tape_stream_connect_record(req->tape_seq, error);
 
   if (req->cb)
     req->cb(req, error);
@@ -1382,6 +1514,32 @@ int uv_write2(uv_write_t* req,
   /* Append the request to write_queue. */
   uv__queue_insert_tail(&stream->write_queue, &req->queue);
 
+  /* Tape: stamp a seq. On record, stash the full logical write now, before
+   * uv__write advances the bufs; the completion (uv__write_callbacks) records
+   * it. On replay, do not touch the socket -- the pump delivers the completion. */
+  req->tape_seq = 0;
+  req->tape_bytes = NULL;
+  req->tape_len = 0;
+  if (UV_TAPE_ACTIVE()) {
+    int replay = uv_tape_stream_submit(&req->tape_seq,
+                                       UV_TAPE_STREAM_KIND_WRITE, req);
+    if (uv_tape_recording()) {
+      size_t total = uv__count_bufs(bufs, nbufs);
+      req->tape_bytes = uv__malloc(total ? total : 1);
+      if (req->tape_bytes != NULL) {
+        size_t off = 0;
+        unsigned int i;
+        for (i = 0; i < nbufs; i++) {
+          memcpy((char*) req->tape_bytes + off, bufs[i].base, bufs[i].len);
+          off += bufs[i].len;
+        }
+        req->tape_len = total;
+      }
+    }
+    if (replay)
+      return 0;   /* completion arrives from the pump */
+  }
+
   /* If the queue was empty when this function began, we should attempt to
    * do the write immediately. Otherwise start the write_watcher and wait
    * for the fd to become writable.
@@ -1426,11 +1584,29 @@ int uv_try_write(uv_stream_t* stream,
 }
 
 
+/* Flatten a buf array into a fresh allocation for the tape. Caller frees. */
+static char* uv__tape_flatten(const uv_buf_t bufs[], unsigned int nbufs,
+                              size_t* out_len) {
+  size_t total = uv__count_bufs(bufs, nbufs);
+  char* flat = uv__malloc(total ? total : 1);
+  *out_len = total;
+  if (flat != NULL) {
+    size_t off = 0;
+    unsigned int i;
+    for (i = 0; i < nbufs; i++) {
+      memcpy(flat + off, bufs[i].base, bufs[i].len);
+      off += bufs[i].len;
+    }
+  }
+  return flat;
+}
+
 int uv_try_write2(uv_stream_t* stream,
                   const uv_buf_t bufs[],
                   unsigned int nbufs,
                   uv_stream_t* send_handle) {
   int err;
+  int r;
 
   /* Connecting or already writing some data */
   if (stream->connect_req != NULL || stream->write_queue_size != 0)
@@ -1440,7 +1616,25 @@ int uv_try_write2(uv_stream_t* stream,
   if (err < 0)
     return err;
 
-  return uv__try_write(stream, bufs, nbufs, send_handle);
+  /* Tape: a synchronous write. On replay, check the bytes and return the
+   * recorded count without touching the socket. On record, do the real write
+   * and record the bytes plus the count. */
+  if (uv_tape_replaying()) {
+    size_t len;
+    char* flat = uv__tape_flatten(bufs, nbufs, &len);
+    r = (int) uv_tape_stream_write_sync_check(flat, flat ? len : 0);
+    if (flat != NULL) uv__free(flat);
+    return r;
+  }
+
+  r = uv__try_write(stream, bufs, nbufs, send_handle);
+  if (uv_tape_recording()) {
+    size_t len;
+    char* flat = uv__tape_flatten(bufs, nbufs, &len);
+    uv_tape_stream_write_sync_record(r, flat, flat ? len : 0);
+    if (flat != NULL) uv__free(flat);
+  }
+  return r;
 }
 
 
@@ -1462,6 +1656,18 @@ int uv__read_start(uv_stream_t* stream,
   stream->read_cb = read_cb;
   stream->alloc_cb = alloc_cb;
 
+  /* Tape: give the stream a deterministic id so recorded reads can find it. On
+   * replay, keep the handle active (so the loop stays alive) but start no real
+   * fd watcher -- the pump delivers the recorded chunks. */
+  if (UV_TAPE_ACTIVE()) {
+    int replay = 0;
+    stream->tape_stream_id = uv_tape_stream_read_start(stream, &replay);
+    if (replay) {
+      uv__handle_start(stream);
+      return 0;
+    }
+  }
+
   uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
   uv__handle_start(stream);
   uv__stream_osx_interrupt_select(stream);
@@ -1475,6 +1681,10 @@ int uv_read_stop(uv_stream_t* stream) {
     return 0;
 
   stream->flags &= ~UV_HANDLE_READING;
+  /* On replay no real watcher was started, but handle_start was, so undo it.
+   * uv__io_stop is a no-op for an fd that was never registered. */
+  if (UV_TAPE_ACTIVE() && stream->tape_stream_id != 0)
+    uv_tape_stream_read_stop(stream);
   uv__io_stop(stream->loop, &stream->io_watcher, POLLIN);
   uv__handle_stop(stream);
   uv__stream_osx_interrupt_select(stream);
@@ -1515,6 +1725,11 @@ int uv___stream_fd(const uv_stream_t* handle) {
 void uv__stream_close(uv_stream_t* handle) {
   unsigned int i;
   uv__stream_queued_fds_t* queued_fds;
+
+  /* Tape: drop any read registration (uv_read_stop below misses it after EOF,
+   * which clears UV_HANDLE_READING and makes it return early). */
+  if (UV_TAPE_ACTIVE() && handle->tape_stream_id != 0)
+    uv_tape_stream_read_stop(handle);
 
 #if defined(__APPLE__)
   /* Terminate select loop first */
