@@ -1819,6 +1819,37 @@ static void uv__fs_tape_payload(uv_fs_t* req, const void** payload, size_t* len)
     *payload = req->tape_read_stash;
     *len = ((size_t) req->result < req->tape_read_len) ? (size_t) req->result
                                                        : req->tape_read_len;
+  } else if (req->fs_type == UV_FS_SCANDIR && req->result > 0 &&
+             req->ptr != NULL) {
+    /* Serialize the whole directory listing so replay can rebuild req->ptr for
+     * uv_fs_scandir_next: per entry, [d_type u8][name_len u16 LE][name].
+     * None have been consumed yet -- record runs before the user callback. */
+    uv__dirent_t** dents = req->ptr;
+    ssize_t i;
+    size_t total = 0;
+    char* p;
+    for (i = 0; i < req->result; i++)
+      total += 3 + strlen(dents[i]->d_name);
+    req->tape_read_stash = uv__malloc(total ? total : 1);
+    if (req->tape_read_stash == NULL) return;
+    p = req->tape_read_stash;
+    for (i = 0; i < req->result; i++) {
+      size_t nlen = strlen(dents[i]->d_name);
+      unsigned char dtype;
+#ifdef HAVE_DIRENT_TYPES
+      dtype = (unsigned char) dents[i]->d_type;
+#else
+      dtype = 0;  /* DT_UNKNOWN; uv__fs_get_dirent_type falls back to lstat-less */
+#endif
+      *p++ = (char) dtype;
+      *p++ = (char) (nlen & 0xff);
+      *p++ = (char) ((nlen >> 8) & 0xff);
+      memcpy(p, dents[i]->d_name, nlen);
+      p += nlen;
+    }
+    req->tape_read_len = total;
+    *payload = req->tape_read_stash;
+    *len = total;
   }
 }
 
@@ -1896,6 +1927,46 @@ void uv__fs_tape_fill(void* reqv, int fs_type, long long result,
       }
       uv_tape_check_write(payload, len, got, total);
       uv__free(got);
+    }
+  } else if (fs_type == UV_FS_SCANDIR) {
+    /* Rebuild the uv__dirent_t** array uv_fs_scandir_next walks. Allocate the
+     * way scandir(3) does (system malloc) so uv__fs_scandir_free can release it,
+     * and reset nbufs (the iteration index). */
+    req->nbufs = 0;
+    req->ptr = NULL;
+    if (result > 0 && payload != NULL) {
+      uv__dirent_t** dents = malloc((size_t) result * sizeof(*dents));
+      if (dents != NULL) {
+        const unsigned char* p = payload;
+        const unsigned char* end = p + len;
+        ssize_t i;
+        for (i = 0; i < result; i++) {
+          uv__dirent_t* dent;
+          size_t nlen, cap, copy;
+          unsigned char dtype;
+          if (p + 3 > end) break;
+          dtype = *p++;
+          nlen = (size_t) p[0] | ((size_t) p[1] << 8);
+          p += 2;
+          if ((size_t)(end - p) < nlen) nlen = (size_t)(end - p);
+          dent = malloc(sizeof(*dent));
+          if (dent == NULL) break;
+          memset(dent, 0, sizeof(*dent));
+#ifdef HAVE_DIRENT_TYPES
+          dent->d_type = dtype;
+#else
+          (void) dtype;
+#endif
+          cap = sizeof(dent->d_name) - 1;
+          copy = nlen < cap ? nlen : cap;
+          memcpy(dent->d_name, p, copy);
+          dent->d_name[copy] = '\0';
+          p += nlen;
+          dents[i] = dent;
+        }
+        req->result = i;   /* however many we rebuilt (== result for a good tape) */
+        req->ptr = dents;
+      }
     }
   }
 
