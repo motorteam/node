@@ -3,8 +3,9 @@
 #include <memory>
 
 // Defined in deps/v8/src/runtime/runtime-trace.cc: render the call tree that
-// the interpreter recorded during a --tape-view replay.
-extern "C" void v8_tape_view_render_plain(void);
+// the interpreter recorded during a --tape-view replay (an interactive TUI on a
+// terminal, a plain tree when piped).
+extern "C" void v8_tape_view_render(void);
 #if HAVE_OPENSSL
 #include "crypto/crypto_util.h"
 #endif  // HAVE_OPENSSL
@@ -137,7 +138,7 @@ void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
 
     // Render the recorded call tree.
     if (!per_process::cli_options->tape_view.empty())
-      v8_tape_view_render_plain();
+      v8_tape_view_render();
   }
 
 #if defined(LEAK_SANITIZER)

@@ -8,6 +8,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 #include "src/execution/arguments-inl.h"
 #include "src/execution/frames-inl.h"
@@ -391,71 +394,277 @@ std::string TapeViewValue(Isolate* isolate, Tagged<Object> v) {
   return "?";
 }
 
-// Render the flat event log as an indented tree (the --plain view).
-void TapeViewRenderPlain() {
-  if (g_tape_view_events == nullptr) {
-    printf("[tape] no calls recorded\n");
-    return;
-  }
-  std::vector<TapeViewEvent>& ev = *g_tape_view_events;
+// A node in the reconstructed call tree. Node 0 is a synthetic root holding the
+// top-level calls as children; it is never displayed.
+struct TVNode {
+  std::string name, args, ret, file;  // file is the full path (for the source pane)
+  int line = 0;
+  int parent = -1;
+  int depth = -1;   // tree nesting level; root's children are 0
+  std::vector<int> kids;
+};
 
-  // Tree nodes built from the (depth) sequence: a call at caller-depth D runs
-  // its callee at depth D+1, so open[D+1] tracks the node executing there.
-  struct Node {
-    std::string label;
-    std::string ret;
-    int parent;
-    std::vector<int> kids;
-  };
-  std::vector<Node> nodes;
-  nodes.push_back({"(program)", "", -1, {}});
-  std::vector<int> open;  // open[d] = node index executing at frame depth d
+// Rebuild the tree from the flat event log. A call at caller-depth D runs its
+// callee at depth D+1, so open[D+1] tracks whoever executes there; a return at
+// depth R closes open[R]. Robust to native callees, which reach no Return.
+std::vector<TVNode> TapeViewBuildTree() {
+  std::vector<TVNode> nodes;
+  nodes.push_back(TVNode{});  // root
+  if (g_tape_view_events == nullptr) return nodes;
 
+  std::vector<int> open;
   auto set_open = [&](size_t d, int idx) {
     if (open.size() <= d) open.resize(d + 1, -1);
     open[d] = idx;
   };
   auto get_open = [&](size_t d) -> int {
-    return (d < open.size() && open[d] >= 0) ? open[d] : 0;  // default: root
+    return (d < open.size() && open[d] >= 0) ? open[d] : 0;
   };
-
-  for (const TapeViewEvent& e : ev) {
+  for (const TapeViewEvent& e : *g_tape_view_events) {
     if (e.is_call) {
       int parent = get_open(e.depth);
-      Node n;
+      TVNode n;
+      n.name = e.name;
+      n.args = e.args;
+      n.file = e.file;
+      n.line = e.line;
       n.parent = parent;
-      char loc[64] = {0};
-      if (e.line > 0)
-        snprintf(loc, sizeof(loc), "  %s:%d", e.file.c_str(), e.line);
-      n.label = e.name + "(" + e.args + ")" + loc;
+      n.depth = nodes[parent].depth + 1;
       int idx = static_cast<int>(nodes.size());
-      nodes.push_back(n);
+      nodes.push_back(std::move(n));
       nodes[parent].kids.push_back(idx);
       set_open(e.depth + 1, idx);
-    } else {
-      if (e.depth < static_cast<int>(open.size()) && open[e.depth] >= 0) {
-        nodes[open[e.depth]].ret = e.ret;
-        open[e.depth] = -1;
-      }
+    } else if (e.depth < static_cast<int>(open.size()) && open[e.depth] >= 0) {
+      nodes[open[e.depth]].ret = e.ret;
+      open[e.depth] = -1;
     }
   }
+  return nodes;
+}
 
-  // Depth-first print.
-  printf("call tree (%zu calls)\n", nodes.size() - 1);
-  std::vector<std::pair<int, int>> stack;  // (node, depth)
-  for (auto it = nodes[0].kids.rbegin(); it != nodes[0].kids.rend(); ++it)
-    stack.push_back({*it, 0});
-  while (!stack.empty()) {
-    auto [idx, d] = stack.back();
-    stack.pop_back();
-    const Node& n = nodes[idx];
-    for (int i = 0; i < d; i++) printf("  ");
-    printf("%s", n.label.c_str());
-    if (!n.ret.empty()) printf("  -> %s", n.ret.c_str());
-    printf("\n");
-    for (auto it = n.kids.rbegin(); it != n.kids.rend(); ++it)
-      stack.push_back({*it, d + 1});
+// One row's text: indent, expand marker, name(args), ↦ return, and basename:line.
+std::string TapeViewRowText(const std::vector<TVNode>& nodes, int id,
+                            const std::vector<char>& expanded) {
+  const TVNode& n = nodes[id];
+  std::string s;
+  for (int i = 0; i < n.depth; i++) s += "  ";
+  bool kids = !n.kids.empty();
+  s += kids ? (expanded[id] ? "▾ " : "▸ ") : "  ";
+  s += n.name + "(" + n.args + ")";
+  if (!n.ret.empty()) s += " ↦ " + n.ret;
+  if (!n.file.empty() && n.line > 0) {
+    s += "   ";
+    s += Basename(n.file.c_str());
+    s += ":" + std::to_string(n.line);
   }
+  return s;
+}
+
+// The non-interactive dump (piped output, or no tty): the whole tree, expanded.
+void TapeViewRenderPlain() {
+  std::vector<TVNode> nodes = TapeViewBuildTree();
+  std::vector<char> expanded(nodes.size(), 1);
+  printf("call tree (%zu calls)\n", nodes.size() - 1);
+  std::vector<int> stack;
+  for (auto it = nodes[0].kids.rbegin(); it != nodes[0].kids.rend(); ++it)
+    stack.push_back(*it);
+  while (!stack.empty()) {
+    int id = stack.back();
+    stack.pop_back();
+    printf("%s\n", TapeViewRowText(nodes, id, expanded).c_str());
+    for (auto it = nodes[id].kids.rbegin(); it != nodes[id].kids.rend(); ++it)
+      stack.push_back(*it);
+  }
+}
+
+// ---- Interactive TUI ------------------------------------------------------
+// A ratatui-style viewer, matching the Ruby and Python ports: a scrollable tree
+// pane over a source pane for the selected call. Keys: j/k move, l/h (or arrows)
+// expand/collapse, g/G top/bottom, q quit.
+
+constexpr int kSourceContext = 4;
+
+struct termios g_saved_term;
+
+void TapeViewRowsWalk(const std::vector<TVNode>& nodes, int id,
+                      const std::vector<char>& expanded, std::vector<int>& rows) {
+  rows.push_back(id);
+  if (!expanded[id]) return;
+  for (int k : nodes[id].kids) TapeViewRowsWalk(nodes, k, expanded, rows);
+}
+
+void TapeViewRowsRebuild(const std::vector<TVNode>& nodes,
+                         const std::vector<char>& expanded,
+                         std::vector<int>& rows) {
+  rows.clear();
+  for (int k : nodes[0].kids) TapeViewRowsWalk(nodes, k, expanded, rows);
+}
+
+void TapeViewTermSize(int* w, int* h) {
+  struct winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+    *w = ws.ws_col;
+    *h = ws.ws_row;
+  } else {
+    *w = 80;
+    *h = 24;
+  }
+}
+
+// Draw the source of the selected call, its definition line highlighted. Read
+// with plain stdio -- the replay is over, so there is no tape to disturb.
+void TapeViewDrawSource(const std::vector<TVNode>& nodes, int id, int top,
+                        int height, int width) {
+  while (id > 0 && nodes[id].file.empty()) id = nodes[id].parent;
+  if (id <= 0) {
+    printf("\x1b[%d;1H\x1b[7m %-*s\x1b[0m", top, width - 1, "(no source)");
+    return;
+  }
+  const TVNode& n = nodes[id];
+  int row = top;
+  char header[1024];
+  snprintf(header, sizeof(header), "%s:%d", n.file.c_str(), n.line);
+  printf("\x1b[%d;1H\x1b[7m %-*s\x1b[0m", row++, width - 1, header);
+  if (n.line < 1) return;
+
+  FILE* f = fopen(n.file.c_str(), "r");
+  if (f == nullptr) {
+    printf("\x1b[%d;1H  (cannot read %s)", row++, n.file.c_str());
+    return;
+  }
+  int from = n.line - kSourceContext;
+  if (from < 1) from = 1;
+  int to = n.line + kSourceContext;
+  char line[512];
+  int lineno = 0;
+  while (fgets(line, sizeof(line), f) && lineno < to && row < top + height) {
+    lineno++;
+    if (lineno < from) continue;
+    line[strcspn(line, "\n")] = '\0';
+    const char* color = (lineno == n.line) ? "\x1b[1;33m" : "\x1b[2m";
+    printf("\x1b[%d;1H%s%5d \xe2\x94\x82 %.*s\x1b[0m", row++, color, lineno,
+           width - 9, line);
+  }
+  fclose(f);
+}
+
+void TapeViewDraw(const std::vector<TVNode>& nodes, const std::vector<int>& rows,
+                  const std::vector<char>& expanded, int cursor, int scroll) {
+  int w, h;
+  TapeViewTermSize(&w, &h);
+  int tree_h = h * 2 / 3;
+  int src_h = h - tree_h - 1;
+
+  fputs("\x1b[2J\x1b[?25l", stdout);
+  printf("\x1b[1;1H\x1b[7m node tape view — %zu calls   "
+         "j/k move  l/h expand/collapse  g/G ends  q quit \x1b[0m",
+         nodes.size() - 1);
+
+  for (int i = 0; i < tree_h - 1; i++) {
+    size_t r = static_cast<size_t>(scroll + i);
+    if (r >= rows.size()) break;
+    std::string text = TapeViewRowText(nodes, rows[r], expanded);
+    printf("\x1b[%d;1H", i + 2);
+    if (static_cast<int>(r) == cursor) fputs("\x1b[7m", stdout);
+    // Truncate to width on a byte basis is unsafe for UTF-8; print and let the
+    // terminal clip. Clear to end of line first so stale text is gone.
+    fputs("\x1b[K", stdout);
+    printf("%s\x1b[0m", text.c_str());
+  }
+  if (!rows.empty())
+    TapeViewDrawSource(nodes, rows[cursor], tree_h + 1, src_h, w);
+  fflush(stdout);
+}
+
+void TapeViewRenderTUI() {
+  std::vector<TVNode> nodes = TapeViewBuildTree();
+  if (nodes.size() <= 1) {
+    printf("[tape] no calls recorded\n");
+    return;
+  }
+  std::vector<char> expanded(nodes.size(), 0);
+  for (size_t i = 0; i < nodes.size(); i++)
+    if (nodes[i].depth < 2) expanded[i] = 1;  // open the first two levels
+
+  std::vector<int> rows;
+  TapeViewRowsRebuild(nodes, expanded, rows);
+
+  if (tcgetattr(STDIN_FILENO, &g_saved_term) < 0) {
+    TapeViewRenderPlain();
+    return;
+  }
+  struct termios t = g_saved_term;
+  t.c_lflag &= ~(ICANON | ECHO);
+  t.c_cc[VMIN] = 1;
+  t.c_cc[VTIME] = 0;
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
+  // Alternate screen, and disable autowrap so long rows clip at the edge instead
+  // of wrapping and shifting every row below them.
+  fputs("\x1b[?1049h\x1b[?7l", stdout);
+
+  int cursor = 0, scroll = 0;
+  for (;;) {
+    int w, h;
+    TapeViewTermSize(&w, &h);
+    int page = h * 2 / 3 - 1;
+    if (page < 1) page = 1;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + page) scroll = cursor - page + 1;
+    TapeViewDraw(nodes, rows, expanded, cursor, scroll);
+
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) break;
+    if (c == 27) {  // escape: could be a bare ESC or an arrow sequence
+      unsigned char seq[2];
+      if (read(STDIN_FILENO, &seq[0], 1) != 1) break;
+      if (seq[0] != '[' || read(STDIN_FILENO, &seq[1], 1) != 1) continue;
+      switch (seq[1]) {
+        case 'A': c = 'k'; break;
+        case 'B': c = 'j'; break;
+        case 'C': c = 'l'; break;
+        case 'D': c = 'h'; break;
+        default: continue;
+      }
+    }
+    int id = rows.empty() ? 0 : rows[cursor];
+    if (c == 'q') break;
+    switch (c) {
+      case 'j':
+        if (static_cast<size_t>(cursor) + 1 < rows.size()) cursor++;
+        break;
+      case 'k':
+        if (cursor > 0) cursor--;
+        break;
+      case 'l':
+        if (!nodes[id].kids.empty() && !expanded[id]) {
+          expanded[id] = 1;
+          TapeViewRowsRebuild(nodes, expanded, rows);
+        } else if (static_cast<size_t>(cursor) + 1 < rows.size()) {
+          cursor++;
+        }
+        break;
+      case 'h':
+        if (expanded[id] && !nodes[id].kids.empty()) {
+          expanded[id] = 0;
+          TapeViewRowsRebuild(nodes, expanded, rows);
+        } else if (nodes[id].parent > 0) {
+          for (size_t r = 0; r < rows.size(); r++)
+            if (rows[r] == nodes[id].parent) { cursor = static_cast<int>(r); break; }
+        }
+        break;
+      case 'g': cursor = 0; break;
+      case 'G': cursor = static_cast<int>(rows.size()) - 1; break;
+      default: break;
+    }
+    if (cursor < 0) cursor = 0;
+    if (cursor >= static_cast<int>(rows.size()))
+      cursor = static_cast<int>(rows.size()) - 1;
+  }
+
+  // Restore autowrap, leave the alternate screen, show the cursor.
+  fputs("\x1b[?7h\x1b[?1049l\x1b[?25h", stdout);
+  tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved_term);
+  fflush(stdout);
 }
 
 }  // namespace
@@ -535,7 +744,7 @@ RUNTIME_FUNCTION(Runtime_TapeViewRecordBytecode) {
       if (script->GetPositionInfo(frame->position(), &info))
         e.line = info.line + 1;
       Tagged<Object> nm = script->name();
-      if (IsString(nm)) e.file = Basename(Cast<String>(nm)->ToCString().get());
+      if (IsString(nm)) e.file = Cast<String>(nm)->ToCString().get();
     }
   } else {
     e.is_call = false;
@@ -554,6 +763,12 @@ RUNTIME_FUNCTION(Runtime_TapeViewRecordBytecode) {
 extern "C" void v8_tape_view_set_live(int live) {
   v8::internal::g_tape_view_live = (live != 0);
 }
-extern "C" void v8_tape_view_render_plain(void) {
-  v8::internal::TapeViewRenderPlain();
+extern "C" void v8_tape_view_render(void) {
+  // A real terminal on both ends gets the interactive TUI; anything piped (a
+  // file, a grep, the CI) gets the plain tree, which is also what makes the
+  // viewer verifiable headlessly.
+  if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+    v8::internal::TapeViewRenderTUI();
+  else
+    v8::internal::TapeViewRenderPlain();
 }
