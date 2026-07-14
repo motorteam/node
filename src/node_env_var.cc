@@ -1,3 +1,4 @@
+#include "../deps/uv/src/uv-tape.h"
 #include "debug_utils-inl.h"
 #include "env-inl.h"
 #include "node_errors.h"
@@ -107,22 +108,33 @@ void DateTimeConfigurationChangeNotification(
 std::optional<std::string> RealEnvStore::Get(const char* key) const {
   Mutex::ScopedLock lock(per_process::env_var_mutex);
 
-  size_t init_sz = 256;
-  MaybeStackBuffer<char, 256> val;
-  int ret = uv_os_getenv(key, *val, &init_sz);
-
-  if (ret == UV_ENOBUFS) {
-    // Buffer is not large enough, reallocate to the updated init_sz
-    // and fetch env value again.
-    val.AllocateSufficientStorage(init_sz);
-    ret = uv_os_getenv(key, *val, &init_sz);
+  // Under replay the real environment is not consulted; the value comes off the
+  // tape. Otherwise do the real read, and (when live) record it.
+  int real_found = 0;
+  std::string real_str;
+  if (!uv_tape_replaying()) {
+    size_t init_sz = 256;
+    MaybeStackBuffer<char, 256> val;
+    int ret = uv_os_getenv(key, *val, &init_sz);
+    if (ret == UV_ENOBUFS) {
+      // Buffer is not large enough, reallocate to the updated init_sz
+      // and fetch env value again.
+      val.AllocateSufficientStorage(init_sz);
+      ret = uv_os_getenv(key, *val, &init_sz);
+    }
+    if (ret >= 0) {  // Env key value fetch success.
+      real_found = 1;
+      real_str.assign(*val, init_sz);
+    }
   }
 
-  if (ret >= 0) {  // Env key value fetch success.
-    return std::string(*val, init_sz);
-  }
-
-  return std::nullopt;
+  const char* value = nullptr;
+  size_t len = 0;
+  int found = uv_tape_env(key, real_found,
+                          real_found ? real_str.data() : nullptr,
+                          real_str.size(), &value, &len);
+  if (!found) return std::nullopt;
+  return std::string(value, len);
 }
 
 MaybeLocal<String> RealEnvStore::Get(Isolate* isolate,

@@ -69,6 +69,9 @@ enum uv_tape_effect {
   /* A synchronous stream write -- uv_try_write, which Node uses for small socket
    * writes before falling back to the async path. Served inline like fs.sync. */
   UV_TAPE_STREAM_WRITE_SYNC = 12,
+  /* An environment-variable read -- process.env.X via uv_os_getenv. Served inline;
+   * records the key (for the divergence check) and the value (or absent). */
+  UV_TAPE_ENV_GET           = 13,
   UV_TAPE_EFFECT_MAX
 };
 
@@ -223,6 +226,14 @@ void uv__stream_tape_deliver_write(void* write_req, int status,
                                    const void* recorded, size_t rlen);
 void uv__stream_tape_deliver_read(void* stream, long long nread,
                                   const void* bytes, size_t len);
+
+/* An environment read -- process.env.X. On record, records the key and the real
+ * result. On replay, ignores the real result and returns the recorded one:
+ * *value points at the recorded bytes (valid until the next tape call) and *len
+ * its length; returns 1 if the variable is present. Diverges if a different key
+ * is read at this point. Untaped/pre-live: passes `real_*` straight through. */
+int uv_tape_env(const char* key, int real_found, const char* real_value,
+                size_t real_len, const char** value, size_t* len);
 
 /* Seal the tape. Called from Node once the program has finished. */
 void uv_tape_finish(int exit_status);

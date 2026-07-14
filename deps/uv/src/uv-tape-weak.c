@@ -64,6 +64,11 @@ UV_TAPE_WEAK void uv_tape_stream_write_sync_record(long long result,
 UV_TAPE_WEAK long long uv_tape_stream_write_sync_check(const void* presented, size_t plen) {
   (void)presented; (void)plen; return 0;
 }
+UV_TAPE_WEAK int uv_tape_env(const char* key, int real_found,
+    const char* real_value, size_t real_len, const char** value, size_t* len) {
+  (void)key; if (value) *value = real_value; if (len) *len = real_len;
+  return real_found;
+}
 /* uv__stream_tape_deliver_* are defined in stream.c (always part of libuv), so
  * they never need a weak fallback. */
 UV_TAPE_WEAK void uv_tape_record_to(const char* path) { (void)path; }

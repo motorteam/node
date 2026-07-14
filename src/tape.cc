@@ -51,6 +51,7 @@ const char* const kEffectFqn[] = {
     "io.read", "io.write", "kernel.halt", "kernel.abort",
     "fs.done", "fs.sync",
     "stream.connect", "stream.write", "stream.read", "stream.write.sync",
+    "env.get",
 };
 
 const char* const kEffectSig[] = {
@@ -67,6 +68,7 @@ const char* const kEffectSig[] = {
     "(seq, [[byte]]) -> int",    // stream.write   -- a write, with its bytes
     "(id, [[byte]]) -> int",     // stream.read    -- a chunk (or EOF) delivered
     "([[byte]]) -> int",         // stream.write.sync -- a synchronous try_write
+    "(str) -> [byte]?",          // env.get        -- an environment read
 };
 
 // ---- Growable byte buffer -------------------------------------------------
@@ -911,6 +913,38 @@ long long uv_tape_stream_write_sync_check(const void* presented, size_t plen) {
   uv_tape_check_write(iov ? iov->bytes.ptr : nullptr, iov ? iov->bytes.len : 0,
                       presented, plen);
   return e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
+}
+
+int uv_tape_env(const char* key, int real_found, const char* real_value,
+                size_t real_len, const char** value, size_t* len) {
+  if (uv_tape_replaying()) {
+    const Entry* e = tape_next(UV_TAPE_ENV_GET);
+    const Iov* kiov = entry_find_iov(e, 0);
+    size_t klen = key ? strlen(key) : 0;
+    if (kiov == nullptr || kiov->bytes.len != klen ||
+        (klen && memcmp(kiov->bytes.ptr, key, klen) != 0)) {
+      tape_diverged("environment read of a different variable than the tape "
+                    "recorded here; the program diverged");
+    }
+    int found = e->ret.len >= 8 ? static_cast<int>(get_i64(e->ret.ptr)) : 0;
+    const Iov* viov = entry_find_iov(e, 1);
+    if (value) *value = viov ? reinterpret_cast<const char*>(viov->bytes.ptr) : nullptr;
+    if (len) *len = viov ? viov->bytes.len : 0;
+    return found;
+  }
+  if (uv_tape_recording()) {
+    Entry* e = entry_begin(UV_TAPE_ENV_GET);
+    if (e) {
+      if (key) entry_iov(e, 0, key, strlen(key));
+      if (real_found && real_value) entry_iov(e, 1, real_value, real_len);
+      put_i64(&e->ret, real_found);
+      entry_commit(e);
+    }
+  }
+  // Untaped or pre-live (module loading): pass the real read straight through.
+  if (value) *value = real_value;
+  if (len) *len = real_len;
+  return real_found;
 }
 
 void uv_tape_finish(int exit_status) {
