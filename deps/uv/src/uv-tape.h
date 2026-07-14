@@ -57,6 +57,9 @@ enum uv_tape_effect {
   /* One async completion delivered by the loop -- the schedule. Carries the
    * request seq, its fs_type, the result, and any payload (statbuf or bytes). */
   UV_TAPE_FS_DONE         = 7,
+  /* A synchronous fs op (cb == NULL) -- served inline at the call site, like a
+   * clock, with no schedule. Carries fs_type, result, and payload. */
+  UV_TAPE_FS_SYNC         = 8,
   UV_TAPE_EFFECT_MAX
 };
 
@@ -69,6 +72,9 @@ enum uv_tape_action {
 
 int uv_tape_recording(void);
 int uv_tape_replaying(void);
+
+/* Activate the tape at the first event-loop iteration (see tape.cc). */
+void uv_tape_go_live(void);
 
 /* True if a tape is active at all. The chokepoints test this first, so an
  * untaped run pays one predictable branch and nothing else. */
@@ -144,6 +150,21 @@ int uv_tape_has_pending(void);
 /* Defined in fs.c: fill a replayed uv_fs_t from tape bytes before its done runs. */
 void uv__fs_tape_fill(void* req, int fs_type, long long result,
                       const void* payload, size_t len);
+
+/* ---- Synchronous fs (served inline, no schedule) --------------------------
+ * Record: write one UV_TAPE_FS_SYNC entry after uv__fs_work runs.
+ * Replay: read the next one; diverges if its fs_type is not `expected`.
+ */
+void uv_tape_fs_sync_record(int fs_type, long long result,
+                            const void* payload, size_t len);
+void uv_tape_fs_sync_next(int expected_fs_type, long long* result,
+                          const void** payload, size_t* len);
+
+/* A write is the one effect where the program hands us its output. Replay does
+ * not re-write, but it checks the bytes the program presents against what was
+ * recorded -- so a program that computes different output is caught. */
+void uv_tape_check_write(const void* recorded, size_t rlen,
+                         const void* presented, size_t plen);
 
 /* Seal the tape. Called from Node once the program has finished. */
 void uv_tape_finish(int exit_status);

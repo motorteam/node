@@ -101,6 +101,8 @@ extern char *mkdtemp(char *template); /* See issue #740 on AIX < 7 */
     req->new_path = NULL;                                                     \
     req->bufs = NULL;                                                         \
     req->cb = cb;                                                             \
+    req->tape_read_stash = NULL;                                              \
+    req->tape_read_len = 0;                                                   \
   }                                                                           \
   while (0)
 
@@ -156,7 +158,7 @@ extern char *mkdtemp(char *template); /* See issue #740 on AIX < 7 */
       return 0;                                                               \
     }                                                                         \
     else {                                                                    \
-      uv__fs_work(&req->work_req);                                            \
+      uv__fs_tape_sync(req);                                                  \
       return req->result;                                                     \
     }                                                                         \
   }                                                                           \
@@ -558,7 +560,7 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
    * itself happens later on the loop thread in uv__fs_done. */
   req->tape_read_stash = NULL;
   req->tape_read_len = 0;
-  if (req->cb != NULL && UV_TAPE_ACTIVE() && r > 0) {
+  if (UV_TAPE_ACTIVE() && r > 0) {
     char* stash = uv__malloc((size_t) r);
     if (stash != NULL) {
       size_t off2 = 0;
@@ -1671,6 +1673,28 @@ static ssize_t uv__fs_write_all(uv_fs_t* req) {
   bufs = req->bufs;
   total = 0;
 
+  /* Capture the outgoing bytes for the tape before the loop below advances
+   * req->bufs past them. Mirrors the read stash in uv__fs_read. */
+  req->tape_read_stash = NULL;
+  req->tape_read_len = 0;
+  if (UV_TAPE_ACTIVE()) {
+    size_t all = 0;
+    unsigned int i;
+    for (i = 0; i < nbufs; i++) all += bufs[i].len;
+    if (all > 0) {
+      char* stash = uv__malloc(all);
+      if (stash != NULL) {
+        size_t off = 0;
+        for (i = 0; i < nbufs; i++) {
+          memcpy(stash + off, bufs[i].base, bufs[i].len);
+          off += bufs[i].len;
+        }
+        req->tape_read_stash = stash;
+        req->tape_read_len = all;
+      }
+    }
+  }
+
   while (nbufs > 0) {
     req->nbufs = nbufs;
     if (req->nbufs > iovmax)
@@ -1777,26 +1801,63 @@ static void uv__fs_work(struct uv__work* w) {
 }
 
 
+/* The output payload of a completed request: statbuf for the stat family, the
+ * stashed bytes for a read, empty otherwise. */
+static void uv__fs_tape_payload(uv_fs_t* req, const void** payload, size_t* len) {
+  *payload = NULL;
+  *len = 0;
+  if (req->fs_type == UV_FS_STAT || req->fs_type == UV_FS_FSTAT ||
+      req->fs_type == UV_FS_LSTAT) {
+    *payload = &req->statbuf;
+    *len = sizeof(req->statbuf);
+  } else if (req->fs_type == UV_FS_READ && req->tape_read_stash != NULL) {
+    *payload = req->tape_read_stash;
+    *len = req->tape_read_len;
+  } else if (req->fs_type == UV_FS_WRITE && req->tape_read_stash != NULL) {
+    /* The bytes we presented to write, captured before write_all advanced the
+     * buffers. Trim to what was actually written. */
+    *payload = req->tape_read_stash;
+    *len = ((size_t) req->result < req->tape_read_len) ? (size_t) req->result
+                                                       : req->tape_read_len;
+  }
+}
+
 /* Gather a completed request's payload and record it, on the loop thread. The
  * payload is a statbuf for the stat family, the bytes read for a read, and empty
  * otherwise (open/close/write carry only a result). */
 static void uv__fs_tape_record(unsigned long long seq, uv_fs_t* req) {
-  const void* payload = NULL;
-  size_t len = 0;
-  char* gathered = NULL;
-
-  if (req->fs_type == UV_FS_STAT || req->fs_type == UV_FS_FSTAT ||
-      req->fs_type == UV_FS_LSTAT) {
-    payload = &req->statbuf;
-    len = sizeof(req->statbuf);
-  } else if (req->fs_type == UV_FS_READ && req->tape_read_stash != NULL) {
-    payload = req->tape_read_stash;
-    len = req->tape_read_len;
-  }
-
+  const void* payload;
+  size_t len;
+  uv__fs_tape_payload(req, &payload, &len);
   uv_tape_record_completion(seq, UV_TAPE_POOL_FS, (int) req->fs_type,
                             (long long) req->result, payload, len);
-  (void) gathered;
+}
+
+/* The synchronous fs path (cb == NULL): uv__fs_work runs inline on the loop
+ * thread, so there is no schedule -- the effect is served inline at the call
+ * site, exactly like a clock. Record after the syscall; on replay serve the
+ * result and payload from the tape and never touch the filesystem. */
+static void uv__fs_tape_sync(uv_fs_t* req) {
+  if (uv_tape_replaying()) {
+    long long result;
+    const void* payload;
+    size_t len;
+    uv_tape_fs_sync_next((int) req->fs_type, &result, &payload, &len);
+    uv__fs_tape_fill(req, (int) req->fs_type, result, payload, len);
+  } else {
+    uv__fs_work(&req->work_req);
+    if (uv_tape_recording()) {
+      const void* payload;
+      size_t len;
+      uv__fs_tape_payload(req, &payload, &len);
+      uv_tape_fs_sync_record((int) req->fs_type, (long long) req->result,
+                             payload, len);
+    }
+  }
+  if (req->tape_read_stash != NULL) {
+    uv__free(req->tape_read_stash);
+    req->tape_read_stash = NULL;
+  }
 }
 
 /* Fill a replayed request from the tape before its done runs. */
@@ -1819,6 +1880,31 @@ void uv__fs_tape_fill(void* reqv, int fs_type, long long result,
       memcpy(req->bufs[i].base, (const char*) payload + off, take);
       off += take;
     }
+  } else if (fs_type == UV_FS_WRITE && result > 0) {
+    /* Replay never re-writes; it checks the program's output against the tape.
+     * Gather what the program presented and compare. */
+    size_t total = 0;
+    unsigned int i;
+    char* got;
+    for (i = 0; i < req->nbufs; i++) total += req->bufs[i].len;
+    got = uv__malloc(total ? total : 1);
+    if (got != NULL) {
+      size_t off = 0;
+      for (i = 0; i < req->nbufs; i++) {
+        memcpy(got + off, req->bufs[i].base, req->bufs[i].len);
+        off += req->bufs[i].len;
+      }
+      uv_tape_check_write(payload, len, got, total);
+      uv__free(got);
+    }
+  }
+
+  /* uv__fs_work (skipped on replay) leaves req->bufs NULL after a read/write.
+   * Match that, so uv_fs_req_cleanup does not free Node's own buffer array
+   * (which may be on the stack for a sync call). */
+  if (fs_type == UV_FS_READ || fs_type == UV_FS_WRITE) {
+    req->bufs = NULL;
+    req->nbufs = 0;
   }
 }
 

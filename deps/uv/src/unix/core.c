@@ -444,6 +444,7 @@ int uv_run(uv_loop_t* loop, uv_run_mode mode) {
   }
 
   while (r != 0 && loop->stop_flag == 0) {
+    uv_tape_go_live();
     can_sleep =
         uv__queue_empty(&loop->pending_queue) &&
         uv__queue_empty(&loop->idle_handles);

@@ -45,7 +45,7 @@ constexpr size_t kCeilingBytes = 64u * 1024 * 1024;
 const char* const kEffectFqn[] = {
     "clock.realtime", "clock.monotonic", "random.bytes",
     "io.read", "io.write", "kernel.halt", "kernel.abort",
-    "fs.done",
+    "fs.done", "fs.sync",
 };
 
 const char* const kEffectSig[] = {
@@ -57,6 +57,7 @@ const char* const kEffectSig[] = {
     "() -> never",               // kernel.halt
     "() -> never",               // kernel.abort
     "(seq, fs) -> int",          // fs.done -- an async completion
+    "(fs) -> int",               // fs.sync -- a synchronous fs op
 };
 
 // ---- Growable byte buffer -------------------------------------------------
@@ -171,6 +172,7 @@ struct Entry {
 struct Tape {
   int recording = 0;
   int replaying = 0;
+  int live = 0;         // false until the event loop starts; see uv_tape_go_live
   char* path = nullptr;
 
   Entry* entries = nullptr;
@@ -562,8 +564,24 @@ bool pending_take(uint64_t seq, Pending* out) {
 
 extern "C" {
 
-int uv_tape_recording(void) { return g_tape.recording && !g_tape.dropped; }
-int uv_tape_replaying(void) { return g_tape.replaying; }
+int uv_tape_recording(void) { return g_tape.recording && g_tape.live && !g_tape.dropped; }
+int uv_tape_replaying(void) { return g_tape.replaying && g_tape.live; }
+
+/*
+ * Go live at the first event-loop iteration.
+ *
+ * Node loads the main module -- and runs its top-level code -- synchronously,
+ * before the loop. That includes reading every module's source from disk, which
+ * is "loading the program, not running it": it must not be on the tape. There is
+ * no clean C++ seam separating module-loading fs from user fs (both are
+ * readFileSync), so the tape is simply inactive until the loop begins. A program
+ * therefore does its taped work in async callbacks (readFile, setImmediate),
+ * which is where Node I/O naturally lives anyway.
+ */
+void uv_tape_go_live(void) {
+  if (g_tape.recording || g_tape.replaying)
+    g_tape.live = 1;
+}
 
 uint64_t uv_tape_hrtime(uint64_t real) {
   if (g_tape.replaying) {
@@ -608,9 +626,11 @@ void uv_tape_random(void* buf, size_t len, int ret) {
 }
 
 int uv_tape_submit(struct uv__work* w, int kind, void* req) {
-  if (!UV_TAPE_ACTIVE()) return 0;
-  // Initiation order is deterministic, so this seq matches between record and
-  // replay -- it is what lets the pump find the right pending request.
+  // Armed, not live: a request issued at top-level (before the loop goes live)
+  // still needs a seq and, on replay, a pending registration -- its completion
+  // arrives in the loop, which is live. The completion is recorded only when
+  // live (entry_begin gates on that), so startup async work, if any, is skipped.
+  if (!g_tape.recording && !g_tape.replaying) return 0;
   w->tape_seq = g_pending.next_seq++;
   if (g_tape.replaying) {
     pending_add(w->tape_seq, w, kind, req);
@@ -681,6 +701,50 @@ int uv_tape_pump(void) {
   // request's cb and re-enters JS -- exactly the normal completion path.
   p.w->done(p.w, 0);
   return 1;
+}
+
+void uv_tape_fs_sync_record(int fs_type, long long result,
+                            const void* payload, size_t len) {
+  Entry* e = entry_begin(UV_TAPE_FS_SYNC);
+  if (e == nullptr) return;
+  put_u32(&e->args, static_cast<uint32_t>(fs_type));
+  if (payload != nullptr && len > 0) entry_iov(e, 0, payload, len);
+  put_i64(&e->ret, result);
+  entry_commit(e);
+}
+
+void uv_tape_fs_sync_next(int expected_fs_type, long long* result,
+                          const void** payload, size_t* len) {
+  const Entry* e = tape_next(UV_TAPE_FS_SYNC);
+  int fs_type = e->args.len >= 4 ? static_cast<int>(get_u32(e->args.ptr)) : 0;
+  if (fs_type != expected_fs_type) {
+    tape_diverged("sync fs op is type %d, but the tape recorded type %d here; "
+                  "the program diverged", expected_fs_type, fs_type);
+  }
+  *result = e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
+  const Iov* iov = entry_find_iov(e, 0);
+  *payload = iov ? iov->bytes.ptr : nullptr;
+  *len = iov ? iov->bytes.len : 0;
+}
+
+void uv_tape_check_write(const void* recorded, size_t rlen,
+                         const void* presented, size_t plen) {
+  size_t n = rlen < plen ? rlen : plen;
+  const uint8_t* r = static_cast<const uint8_t*>(recorded);
+  const uint8_t* p = static_cast<const uint8_t*>(presented);
+  if (rlen == plen && (n == 0 || memcmp(r, p, n) == 0)) return;
+
+  size_t at = 0;
+  while (at < n && r[at] == p[at]) at++;
+  // A short, readable excerpt around the first difference.
+  char rec[80] = {0}, got[80] = {0};
+  size_t from = at > 12 ? at - 12 : 0;
+  for (size_t i = from, o = 0; i < rlen && o < 60; i++)
+    rec[o++] = (r[i] >= 0x20 && r[i] < 0x7f) ? (char)r[i] : (r[i] == '\n' ? '.' : '?');
+  for (size_t i = from, o = 0; i < plen && o < 60; i++)
+    got[o++] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : (p[i] == '\n' ? '.' : '?');
+  tape_diverged("output diverged at byte %zu\n  recorded: %s\n  replayed: %s",
+                at, rec, got);
 }
 
 void uv_tape_finish(int exit_status) {

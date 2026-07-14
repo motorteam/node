@@ -14,6 +14,7 @@
 
 UV_TAPE_WEAK int uv_tape_recording(void) { return 0; }
 UV_TAPE_WEAK int uv_tape_replaying(void) { return 0; }
+UV_TAPE_WEAK void uv_tape_go_live(void) {}
 UV_TAPE_WEAK uint64_t uv_tape_hrtime(uint64_t real) { return real; }
 UV_TAPE_WEAK double uv_tape_clock_millis(double real) { return real; }
 UV_TAPE_WEAK void uv_tape_random(void* buf, size_t len, int ret) {
@@ -29,6 +30,15 @@ UV_TAPE_WEAK void uv_tape_record_completion(unsigned long long seq, int kind,
 }
 UV_TAPE_WEAK int uv_tape_pump(void) { return 0; }
 UV_TAPE_WEAK int uv_tape_has_pending(void) { return 0; }
+UV_TAPE_WEAK void uv_tape_fs_sync_record(int a, long long b, const void* c, size_t d) {
+  (void)a;(void)b;(void)c;(void)d;
+}
+UV_TAPE_WEAK void uv_tape_fs_sync_next(int a, long long* b, const void** c, size_t* d) {
+  (void)a; if(b)*b=0; if(c)*c=0; if(d)*d=0;
+}
+UV_TAPE_WEAK void uv_tape_check_write(const void* a, size_t b, const void* c, size_t d) {
+  (void)a;(void)b;(void)c;(void)d;
+}
 UV_TAPE_WEAK void uv_tape_record_to(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_replay_from(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_inspect(const char* path) { (void)path; }
