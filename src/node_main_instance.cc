@@ -1,3 +1,4 @@
+#include "../deps/uv/src/uv-tape.h"
 #include "node_main_instance.h"
 #include <memory>
 #if HAVE_OPENSSL
@@ -102,12 +103,29 @@ ExitCode NodeMainInstance::Run() {
 
 void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
   if (*exit_code == ExitCode::kNoFailure) {
+    // --tape-inspect is a static read: there is no program to run.
+    if (!per_process::cli_options->tape_inspect.empty()) {
+      uv_tape_inspect(per_process::cli_options->tape_inspect.c_str());
+      *exit_code = ExitCode::kNoFailure;
+      return;
+    }
+    // Arm the tape before the program runs. Startup IO (the module loader, the
+    // compile cache) is paused separately; see NODEJS.md.
+    if (!per_process::cli_options->tape_record.empty())
+      uv_tape_record_to(per_process::cli_options->tape_record.c_str());
+    else if (!per_process::cli_options->tape_replay.empty())
+      uv_tape_replay_from(per_process::cli_options->tape_replay.c_str());
+
     if (!sea::MaybeLoadSingleExecutableApplication(env)) {
       LoadEnvironment(env, StartExecutionCallbackWithModule{});
     }
 
     *exit_code =
         SpinEventLoopInternal(env).FromMaybe(ExitCode::kGenericUserError);
+
+    // Seal the tape once the loop has drained and the program is done.
+    if (UV_TAPE_ACTIVE())
+      uv_tape_finish(static_cast<int>(*exit_code));
   }
 
 #if defined(LEAK_SANITIZER)

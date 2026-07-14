@@ -20,6 +20,7 @@
  */
 
 #include "uv.h"
+#include "uv-tape.h"
 #include "uv-common.h"
 
 #ifdef _WIN32
@@ -28,7 +29,7 @@
 #  include "unix/internal.h"
 #endif
 
-static int uv__random(void* buf, size_t buflen) {
+static int uv__random_impl(void* buf, size_t buflen) {
   int rc;
 
 #if defined(__PASE__)
@@ -66,6 +67,27 @@ static int uv__random(void* buf, size_t buflen) {
   rc = uv__random_devurandom(buf, buflen);
 #endif
 
+  return rc;
+}
+
+/*
+ * The single entropy fill point, used by both the sync (uv_random with cb=NULL)
+ * and async (thread-pool) paths -- hooking here captures the bytes regardless of
+ * how they were requested, the same insight as CPython's pyurandom.
+ *
+ * NOTE: the async path runs on a worker thread, where the recorder's globals are
+ * not safe. This first cut serves the sync path; the async path is handled once
+ * the schedule machinery lands (it records at the completion, on the loop
+ * thread). Under replay, the bytes come off the tape either way.
+ */
+static int uv__random(void* buf, size_t buflen) {
+  if (uv_tape_replaying()) {
+    uv_tape_random(buf, buflen, 0);
+    return 0;
+  }
+  int rc = uv__random_impl(buf, buflen);
+  if (uv_tape_recording())
+    uv_tape_random(buf, buflen, rc);
   return rc;
 }
 

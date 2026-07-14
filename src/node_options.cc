@@ -1350,6 +1350,18 @@ PerIsolateOptionsParser::PerIsolateOptionsParser(
 
 PerProcessOptionsParser::PerProcessOptionsParser(
   const PerIsolateOptionsParser& iop) {
+  AddOption("--tape-record",
+            "record a deterministic tape of this run to PATH",
+            &PerProcessOptions::tape_record,
+            kDisallowedInEnvvar);
+  AddOption("--tape-replay",
+            "replay a tape from PATH instead of doing real IO",
+            &PerProcessOptions::tape_replay,
+            kDisallowedInEnvvar);
+  AddOption("--tape-inspect",
+            "decode and print the tape at PATH, then exit",
+            &PerProcessOptions::tape_inspect,
+            kDisallowedInEnvvar);
   AddOption("--title",
             "the process title to use on startup",
             &PerProcessOptions::title,

@@ -795,6 +795,19 @@ static ExitCode ProcessGlobalArgsInternal(std::vector<std::string>* args,
   }
 #endif
 
+  // A tape needs V8 pinned the same way a snapshot does: Math.random seeded,
+  // hash seed fixed (so property/Map/Set iteration order is stable), and the
+  // concurrent machinery that --predictable disables kept off. Node already
+  // ships exactly this block for snapshots; a tape reuses it. Applied here,
+  // before SetFlagsFromCommandLine locks the flags, and after the parse above
+  // has populated tape_record/tape_replay.
+  if (!per_process::cli_options->tape_record.empty() ||
+      !per_process::cli_options->tape_replay.empty()) {
+    V8::SetFlagsFromString("--predictable");
+    V8::SetFlagsFromString("--random_seed=42");
+    V8::SetFlagsFromString("--hash_seed=1");
+  }
+
   std::vector<char*> v8_args_as_char_ptr(v8_args.size());
   if (v8_args.size() > 0) {
     for (size_t i = 0; i < v8_args.size(); ++i)

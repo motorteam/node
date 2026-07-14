@@ -147,6 +147,7 @@
       'src/node_os.cc',
       'src/node_perf.cc',
       'src/node_platform.cc',
+      'src/tape.cc',
       'src/node_profiling.cc',
       'src/node_postmortem_metadata.cc',
       'src/node_process_events.cc',
@@ -877,6 +878,7 @@
       ],
       'dependencies': [
         'node_js2c#host',
+        'deps/zstd/zstd.gyp:zstd',
       ],
 
       'sources': [

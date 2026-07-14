@@ -1,3 +1,4 @@
+#include "../deps/uv/src/uv-tape.h"
 #include "node_platform.h"
 #include "node_internals.h"
 
@@ -751,7 +752,10 @@ double NodePlatform::MonotonicallyIncreasingTime() {
 }
 
 double NodePlatform::CurrentClockTimeMillis() {
-  return SystemClockTimeMillis();
+  double t = SystemClockTimeMillis();
+  if (UV_TAPE_ACTIVE())
+    return uv_tape_clock_millis(t);
+  return t;
 }
 
 v8::TracingController* NodePlatform::GetTracingController() {

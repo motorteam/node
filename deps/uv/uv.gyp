@@ -47,6 +47,8 @@
       'src/inet.c',
       'src/queue.h',
       'src/random.c',
+      'src/uv-tape.h',
+      'src/uv-tape-weak.c',
       'src/strscpy.c',
       'src/strscpy.h',
       'src/strtok.c',

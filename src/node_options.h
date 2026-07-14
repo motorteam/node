@@ -333,6 +333,10 @@ class PerProcessOptions : public Options {
   std::shared_ptr<PerIsolateOptions> per_isolate{new PerIsolateOptions()};
 
   std::string title;
+  // Deterministic record/replay -- see NODEJS.md. Mutually exclusive.
+  std::string tape_record;
+  std::string tape_replay;
+  std::string tape_inspect;
   std::string trace_event_categories;
   std::string trace_event_file_pattern = "node_trace.${rotation}.log";
   int64_t v8_thread_pool_size = 4;

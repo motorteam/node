@@ -20,6 +20,7 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "uv-tape.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -59,7 +60,11 @@ static void uv__hrtime_init_once(void) {
 
 uint64_t uv__hrtime(uv_clocktype_t type) {
   uv_once(&once, uv__hrtime_init_once);
-  return mach_continuous_time() * timebase.numer / timebase.denom;
+  uint64_t t = mach_continuous_time() * timebase.numer / timebase.denom;
+  /* The whole timer story bottoms out here -- see uv-tape.h. */
+  if (UV_TAPE_ACTIVE())
+    return uv_tape_hrtime(t);
+  return t;
 }
 
 
