@@ -671,7 +671,7 @@ double uv_tape_clock_millis(double real) {
 }
 
 void uv_tape_random(void* buf, size_t len, int ret) {
-  if (g_tape.replaying) {
+  if (uv_tape_replaying()) {
     const Entry* e = tape_next(UV_TAPE_RANDOM_BYTES);
     const Iov* iov = entry_find_iov(e, 0);
     if (iov) memcpy(buf, iov->bytes.ptr, iov->bytes.len < len ? iov->bytes.len : len);
@@ -755,24 +755,42 @@ int uv_tape_pump(void) {
   uint64_t seq = e->args.len >= 4 ? get_u32(e->args.ptr) : 0;
   Pending p;
   if (!pending_take(seq, &p)) {
-    tape_diverged("completion for seq %llu has no matching pending request; "
-                  "the program issued a different sequence of requests",
-                  static_cast<unsigned long long>(seq));
+    // The request for this completion has not been submitted yet -- it is issued
+    // later this turn (a setImmediate/timer callback runs after the pump in the
+    // loop iteration). Yield; the loop's other phases submit it and the next
+    // pump delivers it. A truly divergent program that never issues it drains
+    // the loop, and uv_tape_finish then reports the unconsumed entries.
+    return 0;
   }
 
   // The seq matched, but a divergent program can reuse a seq for a different
   // operation. Check the pending request's kind against the recorded effect so
-  // one operation's result is never served into another.
-  int want_kind = fx == UV_TAPE_FS_DONE        ? UV_TAPE_POOL_FS
-                : fx == UV_TAPE_STREAM_CONNECT  ? UV_TAPE_STREAM_KIND_CONNECT
-                                                : UV_TAPE_STREAM_KIND_WRITE;
-  if (p.kind != want_kind) {
+  // one operation's result is never served into another. A pool completion
+  // (fs.done) is either an fs op or a uv_queue_work job (crypto.randomBytes).
+  bool kind_ok;
+  if (fx == UV_TAPE_FS_DONE)
+    kind_ok = p.kind == UV_TAPE_POOL_FS || p.kind == UV_TAPE_POOL_QUEUE_WORK;
+  else if (fx == UV_TAPE_STREAM_CONNECT)
+    kind_ok = p.kind == UV_TAPE_STREAM_KIND_CONNECT;
+  else
+    kind_ok = p.kind == UV_TAPE_STREAM_KIND_WRITE;
+  if (!kind_ok) {
     tape_diverged("request %llu is a different kind of operation than the tape "
                   "recorded here; the program diverged",
                   static_cast<unsigned long long>(seq));
   }
 
   if (fx == UV_TAPE_FS_DONE) {
+    g_tape.cursor++;
+    if (p.kind == UV_TAPE_POOL_QUEUE_WORK) {
+      // The thread pool never ran under replay, so run the work inline on the
+      // loop thread now (for crypto.randomBytes its DeriveBits is a no-op that
+      // just reports success; the bytes are served from the tape by the job's
+      // own effect), then deliver the completion.
+      p.w->work(p.w);
+      p.w->done(p.w, 0);
+      return 1;
+    }
     int fs_type = e->args.len >= 8 ? static_cast<int>(get_u32(e->args.ptr + 4)) : 0;
     int actual = static_cast<int>(reinterpret_cast<uv_fs_t*>(p.req)->fs_type);
     if (actual != fs_type) {
@@ -780,7 +798,6 @@ int uv_tape_pump(void) {
                     "at this point; the program diverged",
                     static_cast<unsigned long long>(seq), actual, fs_type);
     }
-    g_tape.cursor++;
     uv__fs_tape_fill(p.req, fs_type, result,
                      iov ? iov->bytes.ptr : nullptr, iov ? iov->bytes.len : 0);
     // Runs the fs done wrapper (uv__fs_done): calls the cb, re-enters JS.

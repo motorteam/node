@@ -1,4 +1,5 @@
 #include "crypto/crypto_random.h"
+#include "../../deps/uv/src/uv-tape.h"
 #include "async_wrap-inl.h"
 #include "crypto/crypto_util.h"
 #include "env-inl.h"
@@ -40,6 +41,12 @@ BignumPointer::PrimeCheckCallback getPrimeCheckCallback(Environment* env) {
 }  // namespace
 MaybeLocal<Value> RandomBytesTraits::EncodeOutput(
     Environment* env, const RandomBytesConfig& params, ByteSource* unused) {
+  // The bytes were written in place into the caller's buffer. On the loop
+  // thread (this is where EncodeOutput always runs, for both the sync and the
+  // async job), tape them: record captures the buffer, replay overwrites it
+  // with the recorded bytes -- so crypto.randomBytes replays deterministically.
+  if (UV_TAPE_ACTIVE())
+    uv_tape_random(params.buffer, params.size, 0);
   return Undefined(env->isolate());
 }
 
@@ -70,6 +77,11 @@ bool RandomBytesTraits::DeriveBits(Environment* env,
                                    ByteSource* unused,
                                    CryptoJobMode mode,
                                    CryptoErrorStore* errors) {
+  // Under replay, do not draw real entropy: report success and let EncodeOutput
+  // fill the buffer from the tape. (On replay this runs on the loop thread, via
+  // the schedule pump; on record it runs normally, on the pool thread.)
+  if (uv_tape_replaying())
+    return true;
   return ncrypto::CSPRNG(params.buffer, params.size);
 }
 

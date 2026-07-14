@@ -20,6 +20,7 @@
  */
 
 #include "uv-common.h"
+#include "uv-tape.h"
 
 #if !defined(_WIN32)
 # include "unix/internal.h"
@@ -369,6 +370,13 @@ static void uv__queue_done(struct uv__work* w, int err) {
   req = container_of(w, uv_work_t, work_req);
   uv__req_unregister(req->loop);
 
+  /* Record the completion in delivery order. The job's output (e.g. the random
+   * bytes of crypto.randomBytes) is taped by the job itself on the loop thread
+   * -- here or just after -- so this entry carries only the seq and result. */
+  if (uv_tape_recording())
+    uv_tape_record_completion(w->tape_seq, UV_TAPE_POOL_QUEUE_WORK, 0, err,
+                              NULL, 0);
+
   if (req->after_work_cb == NULL)
     return;
 
@@ -387,6 +395,17 @@ int uv_queue_work(uv_loop_t* loop,
   req->loop = loop;
   req->work_cb = work_cb;
   req->after_work_cb = after_work_cb;
+
+  /* Tape: stamp a seq. On replay, do not run on the pool -- the pump runs the
+   * work inline on the loop thread and then the completion, in recorded order.
+   * uv__work_submit wires w->loop/work/done, which the pump needs, so set them
+   * first, mirroring the fs POST macro. */
+  req->work_req.loop = loop;
+  req->work_req.work = uv__queue_work;
+  req->work_req.done = uv__queue_done;
+  if (uv_tape_submit(&req->work_req, UV_TAPE_POOL_QUEUE_WORK, req))
+    return 0;
+
   uv__work_submit(loop,
                   &req->work_req,
                   UV__WORK_CPU,

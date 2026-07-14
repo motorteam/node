@@ -135,6 +135,8 @@ enum uv_tape_pool_kind {
   UV_TAPE_POOL_FS             = 1,   /* thread-pool fs, keyed by uv__work */
   UV_TAPE_STREAM_KIND_CONNECT = 2,   /* uv_connect_t */
   UV_TAPE_STREAM_KIND_WRITE   = 3,   /* uv_write_t */
+  UV_TAPE_POOL_QUEUE_WORK     = 4,   /* uv_queue_work -- Node's ThreadPoolWork
+                                      * (crypto.randomBytes and other jobs) */
 };
 
 /*
