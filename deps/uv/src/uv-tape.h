@@ -54,6 +54,9 @@ enum uv_tape_effect {
   UV_TAPE_IO_WRITE        = 4,
   UV_TAPE_KERNEL_HALT     = 5,
   UV_TAPE_KERNEL_ABORT    = 6,
+  /* One async completion delivered by the loop -- the schedule. Carries the
+   * request seq, its fs_type, the result, and any payload (statbuf or bytes). */
+  UV_TAPE_FS_DONE         = 7,
   UV_TAPE_EFFECT_MAX
 };
 
@@ -91,6 +94,56 @@ double uv_tape_clock_millis(double real);
 
 /* Entropy -- uv_random, and therefore crypto.randomBytes. */
 void uv_tape_random(void* buf, size_t len, int ret);
+
+/* ---- The async schedule --------------------------------------------------
+ *
+ * This is the part with no analogue in the Ruby or Python ports, because there
+ * the effect boundary was a synchronous call that returned. In Node it is a
+ * callback that fires -- and out of order, because libuv's thread pool completes
+ * work as workers finish, not as the program issued it.
+ *
+ * Initiation order is deterministic (JS is single-threaded), so we stamp a
+ * sequence number on each request at submit. The tape then records completions
+ * in *delivery* order, each tagged with its seq. On replay the thread pool never
+ * runs: uv_tape_submit registers the request as pending instead of posting it,
+ * and the pump (driven from uv_run in place of uv__io_poll) delivers the next
+ * recorded completion to the matching pending request. See NODEJS.md.
+ */
+struct uv__work;
+
+/* Effect kinds for the thread-pool schedule. Append only. */
+enum uv_tape_pool_kind {
+  UV_TAPE_POOL_FS = 1,
+};
+
+/*
+ * At uv__work_submit. Stamps w->tape_seq. Returns 1 if replaying -- the caller
+ * must NOT post to the thread pool; the completion is served by the pump.
+ * Returns 0 on record or with no tape: caller posts normally.
+ */
+int uv_tape_submit(struct uv__work* w, int kind, void* req);
+
+/*
+ * At an effect's completion (its `done` wrapper), on record, on the loop thread.
+ * `result` is the syscall result; `payload`/`len` is the effect's output bytes
+ * (a statbuf, or the bytes read; empty for open/close).
+ */
+void uv_tape_record_completion(unsigned long long seq, int kind, int fs_type,
+                               long long result, const void* payload, size_t len);
+
+/*
+ * Deliver the next recorded completion: find the pending request by seq, fill it
+ * from the tape (via uv__fs_tape_fill for fs), and call its done. Returns 1 if
+ * one was delivered, 0 if none is pending. Called from uv_run under replay.
+ */
+int uv_tape_pump(void);
+
+/* True while replay has pending completions -- keeps the loop alive. */
+int uv_tape_has_pending(void);
+
+/* Defined in fs.c: fill a replayed uv_fs_t from tape bytes before its done runs. */
+void uv__fs_tape_fill(void* req, int fs_type, long long result,
+                      const void* payload, size_t len);
 
 /* Seal the tape. Called from Node once the program has finished. */
 void uv_tape_finish(int exit_status);

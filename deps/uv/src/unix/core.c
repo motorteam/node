@@ -19,6 +19,7 @@
  */
 
 #include "uv.h"
+#include "uv-tape.h"
 #include "internal.h"
 #include "strtok.h"
 
@@ -457,7 +458,12 @@ int uv_run(uv_loop_t* loop, uv_run_mode mode) {
 
     uv__metrics_inc_loop_count(loop);
 
-    uv__io_poll(loop, timeout);
+    /* Under replay the thread pool never runs, so completions do not arrive
+     * through the kernel -- the pump delivers the next recorded one instead. */
+    if (uv_tape_replaying())
+      uv_tape_pump();
+    else
+      uv__io_poll(loop, timeout);
 
     /* Process immediate callbacks (e.g. write_cb) a small fixed number of
      * times to avoid loop starvation.*/

@@ -20,6 +20,15 @@ UV_TAPE_WEAK void uv_tape_random(void* buf, size_t len, int ret) {
   (void)buf; (void)len; (void)ret;
 }
 UV_TAPE_WEAK void uv_tape_finish(int exit_status) { (void)exit_status; }
+UV_TAPE_WEAK int uv_tape_submit(struct uv__work* w, int kind, void* req) {
+  (void)w; (void)kind; (void)req; return 0;
+}
+UV_TAPE_WEAK void uv_tape_record_completion(unsigned long long seq, int kind,
+    int fs_type, long long result, const void* payload, size_t len) {
+  (void)seq; (void)kind; (void)fs_type; (void)result; (void)payload; (void)len;
+}
+UV_TAPE_WEAK int uv_tape_pump(void) { return 0; }
+UV_TAPE_WEAK int uv_tape_has_pending(void) { return 0; }
 UV_TAPE_WEAK void uv_tape_record_to(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_replay_from(const char* path) { (void)path; }
 UV_TAPE_WEAK void uv_tape_inspect(const char* path) { (void)path; }

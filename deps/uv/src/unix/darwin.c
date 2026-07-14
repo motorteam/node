@@ -60,11 +60,13 @@ static void uv__hrtime_init_once(void) {
 
 uint64_t uv__hrtime(uv_clocktype_t type) {
   uv_once(&once, uv__hrtime_init_once);
-  uint64_t t = mach_continuous_time() * timebase.numer / timebase.denom;
-  /* The whole timer story bottoms out here -- see uv-tape.h. */
-  if (UV_TAPE_ACTIVE())
-    return uv_tape_hrtime(t);
-  return t;
+  /* NOTE: the monotonic clock is intentionally NOT taped here. libuv reads it
+   * per loop iteration for metrics, and those reads do not recur on replay
+   * (the pump replaces uv__io_poll), so taping them here misaligns the tape.
+   * The JS-observable monotonic clocks (performance.now, process.hrtime) will be
+   * taped at their Node binding sites instead; see NODEJS.md. Date.now (wall) is
+   * taped at NodePlatform::CurrentClockTimeMillis, which is JS-driven only. */
+  return mach_continuous_time() * timebase.numer / timebase.denom;
 }
 
 

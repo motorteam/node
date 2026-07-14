@@ -27,6 +27,7 @@
  */
 
 #include "uv.h"
+#include "uv-tape.h"
 #include "internal.h"
 
 #include <errno.h>
@@ -140,6 +141,13 @@ extern char *mkdtemp(char *template); /* See issue #740 on AIX < 7 */
   do {                                                                        \
     if (cb != NULL) {                                                         \
       uv__req_register(loop);                                                 \
+      /* Replay skips uv__work_submit, which is what wires w->done. Set the    \
+       * work/done pair here so the pump can deliver through it either way. */ \
+      req->work_req.loop = loop;                                              \
+      req->work_req.work = uv__fs_work;                                       \
+      req->work_req.done = uv__fs_done;                                       \
+      if (uv_tape_submit(&req->work_req, UV_TAPE_POOL_FS, req))               \
+        return 0;  /* replaying: the pump delivers this completion */         \
       uv__work_submit(loop,                                                   \
                       &req->work_req,                                         \
                       UV__WORK_FAST_IO,                                       \
@@ -544,6 +552,27 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
     }
   }
 #endif
+
+  /* Capture the bytes for the tape before the buffer list is dropped. Worker
+   * thread, but the stash is req-local, so nothing shared is touched; the record
+   * itself happens later on the loop thread in uv__fs_done. */
+  req->tape_read_stash = NULL;
+  req->tape_read_len = 0;
+  if (req->cb != NULL && UV_TAPE_ACTIVE() && r > 0) {
+    char* stash = uv__malloc((size_t) r);
+    if (stash != NULL) {
+      size_t off2 = 0;
+      unsigned int i;
+      for (i = 0; i < req->nbufs && off2 < (size_t) r; i++) {
+        size_t take = req->bufs[i].len;
+        if (take > (size_t) r - off2) take = (size_t) r - off2;
+        memcpy(stash + off2, req->bufs[i].base, take);
+        off2 += take;
+      }
+      req->tape_read_stash = stash;
+      req->tape_read_len = (size_t) r;
+    }
+  }
 
   /* We don't own the buffer list in the synchronous case. */
   if (req->cb != NULL)
@@ -1748,6 +1777,51 @@ static void uv__fs_work(struct uv__work* w) {
 }
 
 
+/* Gather a completed request's payload and record it, on the loop thread. The
+ * payload is a statbuf for the stat family, the bytes read for a read, and empty
+ * otherwise (open/close/write carry only a result). */
+static void uv__fs_tape_record(unsigned long long seq, uv_fs_t* req) {
+  const void* payload = NULL;
+  size_t len = 0;
+  char* gathered = NULL;
+
+  if (req->fs_type == UV_FS_STAT || req->fs_type == UV_FS_FSTAT ||
+      req->fs_type == UV_FS_LSTAT) {
+    payload = &req->statbuf;
+    len = sizeof(req->statbuf);
+  } else if (req->fs_type == UV_FS_READ && req->tape_read_stash != NULL) {
+    payload = req->tape_read_stash;
+    len = req->tape_read_len;
+  }
+
+  uv_tape_record_completion(seq, UV_TAPE_POOL_FS, (int) req->fs_type,
+                            (long long) req->result, payload, len);
+  (void) gathered;
+}
+
+/* Fill a replayed request from the tape before its done runs. */
+void uv__fs_tape_fill(void* reqv, int fs_type, long long result,
+                      const void* payload, size_t len) {
+  uv_fs_t* req = reqv;
+  req->result = (ssize_t) result;
+
+  if (fs_type == UV_FS_STAT || fs_type == UV_FS_FSTAT || fs_type == UV_FS_LSTAT) {
+    if (payload != NULL && len == sizeof(req->statbuf)) {
+      memcpy(&req->statbuf, payload, len);
+      req->ptr = &req->statbuf;
+    }
+  } else if (fs_type == UV_FS_READ && result > 0 && payload != NULL) {
+    size_t off = 0;
+    unsigned int i;
+    for (i = 0; i < req->nbufs && off < (size_t) result; i++) {
+      size_t take = req->bufs[i].len;
+      if (take > (size_t) result - off) take = (size_t) result - off;
+      memcpy(req->bufs[i].base, (const char*) payload + off, take);
+      off += take;
+    }
+  }
+}
+
 static void uv__fs_done(struct uv__work* w, int status) {
   uv_fs_t* req;
 
@@ -1757,6 +1831,13 @@ static void uv__fs_done(struct uv__work* w, int status) {
   if (status == UV_ECANCELED) {
     assert(req->result == 0);
     req->result = UV_ECANCELED;
+  }
+
+  if (uv_tape_recording())
+    uv__fs_tape_record(w->tape_seq, req);
+  if (req->tape_read_stash != NULL) {
+    uv__free(req->tape_read_stash);
+    req->tape_read_stash = NULL;
   }
 
   req->cb(req);

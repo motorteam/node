@@ -372,6 +372,8 @@ typedef struct {
   double mtime;                                                               \
   struct uv__work work_req;                                                   \
   uv_buf_t bufsml[4];                                                         \
+  void* tape_read_stash;   /* read bytes captured before bufs is freed */     \
+  size_t tape_read_len;                                                       \
 
 #define UV_WORK_PRIVATE_FIELDS                                                \
   struct uv__work work_req;

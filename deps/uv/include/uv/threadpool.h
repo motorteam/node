@@ -32,6 +32,7 @@ struct uv__work {
   void (*done)(struct uv__work *w, int status);
   struct uv_loop_s* loop;
   struct uv__queue wq;
+  unsigned long long tape_seq;  /* stamped at submit; keys the replay pump */
 };
 
 #endif /* UV_THREADPOOL_H_ */

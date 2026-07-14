@@ -20,6 +20,7 @@
  * next; see NODEJS.md.
  */
 
+#include "uv.h"
 #include "../deps/uv/src/uv-tape.h"
 
 #include <cerrno>
@@ -44,6 +45,7 @@ constexpr size_t kCeilingBytes = 64u * 1024 * 1024;
 const char* const kEffectFqn[] = {
     "clock.realtime", "clock.monotonic", "random.bytes",
     "io.read", "io.write", "kernel.halt", "kernel.abort",
+    "fs.done",
 };
 
 const char* const kEffectSig[] = {
@@ -54,6 +56,7 @@ const char* const kEffectSig[] = {
     "(int, [[byte]]) -> int",    // io.write
     "() -> never",               // kernel.halt
     "() -> never",               // kernel.abort
+    "(seq, fs) -> int",          // fs.done -- an async completion
 };
 
 // ---- Growable byte buffer -------------------------------------------------
@@ -511,6 +514,50 @@ void rule(size_t width, char fill) {
 
 }  // namespace
 
+// ---- The async schedule ---------------------------------------------------
+//
+// A pending request is one the program has issued (uv__work_submit) but whose
+// completion has not yet been delivered. On replay the thread pool never runs,
+// so every submitted request waits here until the pump delivers its recorded
+// completion, keyed by the seq stamped at submit.
+
+struct Pending {
+  uint64_t seq;
+  struct uv__work* w;
+  int kind;
+  void* req;
+};
+
+struct {
+  Pending* items = nullptr;
+  size_t n = 0;
+  size_t cap = 0;
+  uint64_t next_seq = 1;   // 0 is reserved for "not a tape request"
+} g_pending;
+
+void pending_add(uint64_t seq, struct uv__work* w, int kind, void* req) {
+  if (g_pending.n == g_pending.cap) {
+    size_t cap = g_pending.cap ? g_pending.cap * 2 : 32;
+    g_pending.items = static_cast<Pending*>(realloc(g_pending.items, cap * sizeof(Pending)));
+    if (g_pending.items == nullptr) abort();
+    g_pending.cap = cap;
+  }
+  Pending* p = &g_pending.items[g_pending.n++];
+  p->seq = seq; p->w = w; p->kind = kind; p->req = req;
+}
+
+// Find and remove the pending request with this seq.
+bool pending_take(uint64_t seq, Pending* out) {
+  for (size_t i = 0; i < g_pending.n; i++) {
+    if (g_pending.items[i].seq == seq) {
+      *out = g_pending.items[i];
+      g_pending.items[i] = g_pending.items[--g_pending.n];
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- The C ABI declared in uv-tape.h --------------------------------------
 
 extern "C" {
@@ -560,10 +607,99 @@ void uv_tape_random(void* buf, size_t len, int ret) {
   }
 }
 
+int uv_tape_submit(struct uv__work* w, int kind, void* req) {
+  if (!UV_TAPE_ACTIVE()) return 0;
+  // Initiation order is deterministic, so this seq matches between record and
+  // replay -- it is what lets the pump find the right pending request.
+  w->tape_seq = g_pending.next_seq++;
+  if (g_tape.replaying) {
+    pending_add(w->tape_seq, w, kind, req);
+    return 1;   // caller must not post to the pool
+  }
+  return 0;
+}
+
+void uv_tape_record_completion(unsigned long long seq, int kind, int fs_type,
+                               long long result, const void* payload, size_t len) {
+  (void)kind;
+  Entry* e = entry_begin(UV_TAPE_FS_DONE);
+  if (e == nullptr) return;
+  put_u32(&e->args, static_cast<uint32_t>(seq));
+  put_u32(&e->args, static_cast<uint32_t>(fs_type));
+  if (payload != nullptr && len > 0) entry_iov(e, 0, payload, len);
+  put_i64(&e->ret, result);
+  entry_commit(e);
+}
+
+int uv_tape_has_pending(void) {
+  return g_tape.replaying && g_pending.n > 0;
+}
+
+int uv_tape_pump(void) {
+  if (!g_tape.replaying) return 0;
+  if (g_tape.cursor >= g_tape.n_entries) return 0;
+
+  const Entry* e = &g_tape.entries[g_tape.cursor];
+  if (e->func_index != UV_TAPE_FS_DONE) {
+    // The next recorded effect is not a completion -- so it is a clock/random
+    // read that the program's synchronous code should have consumed already, or
+    // the terminal halt. Either way there is nothing for the loop to deliver.
+    return 0;
+  }
+
+  uint64_t seq = e->args.len >= 4 ? get_u32(e->args.ptr) : 0;
+  int fs_type  = e->args.len >= 8 ? static_cast<int>(get_u32(e->args.ptr + 4)) : 0;
+  int64_t result = e->ret.len >= 8 ? get_i64(e->ret.ptr) : 0;
+  const Iov* iov = entry_find_iov(e, 0);
+
+  Pending p;
+  if (!pending_take(seq, &p)) {
+    tape_diverged("completion for seq %llu has no matching pending request; "
+                  "the program issued a different sequence of requests",
+                  static_cast<unsigned long long>(seq));
+  }
+
+  // The seq matched, but a different program can reuse the same seq for a
+  // different operation. Check the request's actual type against what was
+  // recorded, so a divergent program stops here rather than getting one
+  // operation's result served into another.
+  if (p.kind == UV_TAPE_POOL_FS) {
+    int actual = static_cast<int>(reinterpret_cast<uv_fs_t*>(p.req)->fs_type);
+    if (actual != fs_type) {
+      tape_diverged("request %llu is fs_type %d, but the tape recorded fs_type %d "
+                    "at this point; the program diverged",
+                    static_cast<unsigned long long>(seq), actual, fs_type);
+    }
+  }
+  g_tape.cursor++;
+
+  if (p.kind == UV_TAPE_POOL_FS) {
+    uv__fs_tape_fill(p.req, fs_type, result,
+                     iov ? iov->bytes.ptr : nullptr, iov ? iov->bytes.len : 0);
+  }
+  // Deliver: this runs the effect's done wrapper (uv__fs_done), which calls the
+  // request's cb and re-enters JS -- exactly the normal completion path.
+  p.w->done(p.w, 0);
+  return 1;
+}
+
 void uv_tape_finish(int exit_status) {
   int aborted = exit_status != 0;
   if (g_tape.replaying) {
-    fprintf(stderr, "[tape] replayed %zu of %zu entries\n", g_tape.cursor, g_tape.n_entries);
+    // The terminal entry is consumed here, not by the pump, so a fully-replayed
+    // run ends with the cursor one short.
+    int expected = aborted ? UV_TAPE_KERNEL_ABORT : UV_TAPE_KERNEL_HALT;
+    const Entry* e = tape_next(expected);
+    (void) e;
+    if (g_pending.n != 0) {
+      fprintf(stderr, "[tape] %zu request(s) never completed; program diverged\n",
+              g_pending.n);
+    } else if (g_tape.cursor != g_tape.n_entries) {
+      fprintf(stderr, "[tape] replay stopped %zu entries early; program diverged\n",
+              g_tape.n_entries - g_tape.cursor);
+    } else {
+      fprintf(stderr, "[tape] replayed %zu entries, no divergence\n", g_tape.n_entries);
+    }
     g_tape.replaying = 0;
     return;
   }
